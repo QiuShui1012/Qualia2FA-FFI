@@ -35,11 +35,24 @@ jobs:
       #
       # 因此这里把核心检出到**本仓库内**的 `Core/`。这与本地布局一致：
       # 端侧把本仓库当 submodule 引入时，同一位置由 `Main/Core` 提供。
-      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
+      # 本 crate 以 `path = "../Core"` 与 `path = "../QualiaDeviceIdentityKit"`
+      # 依赖两个**同级**仓库，因此 CI 必须把它们都检出到同级位置。
+      #
+      # 这里刻意**保留** `../` 前缀：扁平布局下 Core 与 DIK 都是本仓库的邻居，
+      # 而「相对工作区根解析」这条规则让本地与 CI 的布局完全一致。先用嵌套
+      # submodule（`path = "Core"`）试过，那条路会让同一个物理目录被两处用不同
+      # 相对路径引用，Cargo 报 `package collision in the lockfile`。
+      - name: 取出 qualia2fa-core（满足 path = "../Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: Qualia2FA/Qualia2FA-Core
-          path: Core
+          path: ../Core
+
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -66,11 +79,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
+      # 本 crate 以 `path = "../Core"` 与 `path = "../QualiaDeviceIdentityKit"`
+      # 依赖两个**同级**仓库，因此 CI 必须把它们都检出到同级位置。
+      #
+      # 这里刻意**保留** `../` 前缀：扁平布局下 Core 与 DIK 都是本仓库的邻居，
+      # 而「相对工作区根解析」这条规则让本地与 CI 的布局完全一致。先用嵌套
+      # submodule（`path = "Core"`）试过，那条路会让同一个物理目录被两处用不同
+      # 相对路径引用，Cargo 报 `package collision in the lockfile`。
+      - name: 取出 qualia2fa-core（满足 path = "../Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: Qualia2FA/Qualia2FA-Core
-          path: Core
+          path: ../Core
+
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
 
       # 必须用 `--all-targets`，不能写成 `--bin uniffi-bindgen`：
       # 后者**只构建那个二进制**，不会产出 cdylib。而绑定生成器要读的正是

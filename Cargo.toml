@@ -39,7 +39,7 @@ crate-type = ["cdylib", "staticlib"]
 # 不带前缀的 `Core` 则稳定地解析到「仓库内的 Core/」，在本地与 CI 上一致：
 #   - 本地：`Qualia2FA/Main/Core`（本仓库作为 submodule 被引入后）
 #   - CI  ：`<仓库根>/Core`（由 .github/workflows/ci.yml 显式检出）
-qualia2fa-core = { path = "Core" }
+qualia2fa-core = { path = "../Core" }
 
 # 设备身份：`DevicePublicKey` / `DeviceSignature` 的类型与解析都在这里。
 #
@@ -90,3 +90,16 @@ uniffi = { version = "0.29", features = ["cli"] }
 # 这两项**只进测试目标**，不会链接进 cdylib/staticlib。
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.11"
+# 声明本仓库是一个工作区（只含本 crate）。
+#
+# # 它为什么必需
+#
+# 带 `../` 前缀的路径依赖以**工作区根目录**为基准解析。不声明时工作区根就是本清单
+# 所在目录（因为这里没有别的清单文件），本地与 CI 恰好一致；但当 `Core/` 曾被当作
+# 嵌套 submodule 时，那种「恰好」会让同一个物理目录被两处用不同相对路径引用，Cargo
+# 于是把它们当成两个包（`package collision in the lockfile`）。
+#
+# 写下来之后，「本目录是工作区根、`../Core` 与 `../QualiaDeviceIdentityKit` 都是
+# 同级仓库」成为一条明确的事实，而不是由目录里恰好没有什么文件所决定的巧合。
+[workspace]
+resolver = "3"
