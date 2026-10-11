@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Qualia2FA 的 FFI 层：把 qualia2fa-core 暴露为 UniFFI 绑定，供 Kotlin/Swift 等调用"
 license = "LGPL-3.0-or-later"
-repository = "https://github.com/QiuShui1012/Qualia2FA-FFI"
+repository = "https://github.com/Qualia2FA/Qualia2FA-FFI"
 readme = "README.md"
 publish = false
 
@@ -40,6 +40,19 @@ crate-type = ["cdylib", "staticlib"]
 #   - 本地：`Qualia2FA/Main/Core`（本仓库作为 submodule 被引入后）
 #   - CI  ：`<仓库根>/Core`（由 .github/workflows/ci.yml 显式检出）
 qualia2fa-core = { path = "Core" }
+
+# 设备身份：`DevicePublicKey` / `DeviceSignature` 的类型与解析都在这里。
+#
+# # 为什么本 crate 直接依赖它，而 Core 也依赖它
+#
+# FFI 层要把端侧回调（`FfiDeviceKeys::get_or_create` / `sign`）返回的**裸字节**转成
+# 类型化的值，而那两个类型定义在设备身份库（`qualia-dik`）里，不在 Core 里。Core 只是
+# **再导出**它们以便下游少写一个依赖；在 FFI 这层，回调的签名直接用原类型更清楚——
+# 再导出是给「只依赖 Core 的调用方」用的便利，不是要求。
+#
+# 路径与 Core 用的**同一条**（`../QualiaDeviceIdentityKit`），因为它与 Core 是同级
+# 目录。这一点必须在 CI 里成立：workflow 会把两个仓库都检出到同级位置。
+qualia-dik = { path = "../QualiaDeviceIdentityKit" }
 
 # 用于 `FfiError` 的 `Display` 与 `std::error::Error` 实现。
 # 与核心同一个 major（2.0.21），不会引入重复版本。

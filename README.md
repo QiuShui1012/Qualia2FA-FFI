@@ -1,6 +1,6 @@
 # Qualia2FA-FFI
 
-把 [`qualia2fa-core`](https://github.com/QiuShui1012/Qualia2FA-Core) 暴露为
+把 [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) 暴露为
 [UniFFI](https://mozilla.github.io/uniffi-rs/) 绑定，供 Kotlin、Swift 等托管语言调用。
 
 | 项 | 值 |

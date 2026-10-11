@@ -38,7 +38,7 @@ jobs:
       - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
-          repository: QiuShui1012/Qualia2FA-Core
+          repository: Qualia2FA/Qualia2FA-Core
           path: Core
 
       - name: cargo fmt --check
@@ -69,7 +69,7 @@ jobs:
       - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
-          repository: QiuShui1012/Qualia2FA-Core
+          repository: Qualia2FA/Qualia2FA-Core
           path: Core
 
       # 必须用 `--all-targets`，不能写成 `--bin uniffi-bindgen`：

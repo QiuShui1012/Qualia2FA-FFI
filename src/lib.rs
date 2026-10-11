@@ -38,7 +38,7 @@ uniffi::setup_scaffolding!();
 use std::sync::Arc;
 
 use qualia2fa_core::auth;
-use qualia2fa_core::device::{DevicePublicKey, DeviceSignature};
+use qualia_dik::{DevicePublicKey, DeviceSignature};
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::recovery::KdfParams;
@@ -197,6 +197,16 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         // ── M3：设备身份、配对、恢复、挑战-应答 ──────────────────────────
         Error::DevicePublicKeyInvalid { .. } => "device_public_key_invalid",
         Error::DeviceSignatureInvalid { .. } => "device_signature_invalid",
+        // 设备身份库自己报出的失败。分成三个 kind 而不是一个笼统的 "device_error"：
+        // 端侧对它们的处置不同——公钥不合法要重新扫码，验签不通过是安全事件，而
+        // 「本机没有硬件密钥库」要引导用户换机器或接受软件密钥。
+        Error::Device(qualia_dik::Error::DevicePublicKeyInvalid { .. }) => {
+            "device_public_key_invalid"
+        }
+        Error::Device(qualia_dik::Error::DeviceSignatureInvalid { .. }) => {
+            "device_signature_invalid"
+        }
+        Error::Device(_) => "device_error",
         Error::PairingPayloadMalformed { .. } => "pairing_payload_malformed",
         Error::PairingUnsupportedVersion { .. } => "pairing_unsupported_version",
         // 配对失败的原因**刻意不细分**（密文被改、会话不对、加入方公钥不对都归这里），
@@ -755,7 +765,10 @@ impl qualia2fa_core::flow::DeviceKeys for ForeignDeviceKeys {
             .0
             .get_or_create(label.to_owned())
             .map_err(ffi_to_core_error)?;
-        DevicePublicKey::from_sec1_bytes(&bytes)
+        // `?` 把设备身份库的错误经核心的 `Error::Device` 转换过来（`#[from]` 提供）。
+        // 端侧回调报的错仍然走 `ffi_to_core_error`：那是**跨边界**的失败，与本地
+        // 解析失败不是一回事，两者不该混成一个分支。
+        Ok(DevicePublicKey::from_sec1_bytes(&bytes)?)
     }
 
     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature, Error> {
@@ -763,7 +776,7 @@ impl qualia2fa_core::flow::DeviceKeys for ForeignDeviceKeys {
             .0
             .sign(label.to_owned(), message.to_vec())
             .map_err(ffi_to_core_error)?;
-        DeviceSignature::from_bytes(&bytes)
+        Ok(DeviceSignature::from_bytes(&bytes)?)
     }
 }
 
@@ -822,9 +835,11 @@ fn ffi_to_core_error(source: FfiError) -> Error {
 fn kind_to_core_error(kind: &str) -> Error {
     match kind {
         "device_key_missing" => Error::DeviceKeyMissing,
-        "device_signature_invalid" => Error::DeviceSignatureInvalid {
-            reason: "端侧签名失败",
-        },
+        "device_signature_invalid" => Error::Device(
+            qualia_dik::Error::DeviceSignatureInvalid {
+                reason: "端侧签名失败",
+            },
+        ),
         "secure_store_write_failed" => Error::SecureStoreWriteFailed {
             reason: "端侧密钥库拒绝写入",
         },

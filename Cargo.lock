@@ -698,6 +698,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qualia-dik"
+version = "0.1.0"
+dependencies = [
+ "p256",
+ "sha2",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
 name = "qualia2fa-core"
 version = "0.1.0"
 dependencies = [
@@ -709,6 +719,7 @@ dependencies = [
  "hmac",
  "miniz_oxide",
  "p256",
+ "qualia-dik",
  "secrecy",
  "sha1",
  "sha2",

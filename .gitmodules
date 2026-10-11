@@ -1,3 +1,6 @@
 [submodule "Core"]
 	path = Core
 	url = https://github.com/QiuShui1012/Qualia2FA-Core.git
+[submodule "QualiaDeviceIdentityKit"]
+	path = QualiaDeviceIdentityKit
+	url = https://github.com/Qualia2FA/QualiaDeviceIdentityKit.git
