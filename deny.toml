@@ -1,0 +1,128 @@
+# cargo-deny 配置。
+#
+# 本项目的依赖策略依据（见 TODO.md §4.1）：RustSec 库 2026 年新增 334 条公告，
+# 而上游每一次严重问题都是补丁/次版本修掉的。因此「依赖审计」是安全控制，不是杂事。
+#
+# 参考：https://embarkstudios.github.io/cargo-deny/
+#
+# # 为什么这份配置与 `Core/deny.toml` 不一样
+#
+# 两个 crate 的使用方式不同，因此许可证边界也不同：
+#
+# - `qualia2fa-core` 是**库**，以 LGPL-3.0-or-later 发布，会被别人的项目链接。
+#   因此它的依赖必须能与**任意**下游许可证共存，边界比本仓库紧。
+# - `qualia2fa-ffi` 是**应用的一部分**，只被 Qualia2FA 本体（AGPL-3.0-or-later）
+#   静态链接，不单独分发。因此它能接受的依赖集与 Core 不同。
+#
+# 两份配置各自显式列出自己那一侧的清单，**不要**为了「少维护一份」而合并：
+# 合并的结果是库那侧被悄悄放宽，而放宽是不会有任何东西报错的。
+
+[graph]
+# 按目标平台分别评估依赖，避免把 Linux 专有依赖算到 Windows 构建上。
+# 这三个是应用要真正发布的平台（见 TODO.md 的里程碑划分）。
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-linux-android" },
+    { triple = "aarch64-apple-ios" },
+]
+all-features = true
+
+[advisories]
+# 发现任何未处理的漏洞即失败。
+# 注意：`vulnerability` 是硬失败，不接受「先记账」。
+version = 2
+ignore = [
+    # 如有必须暂时接受的公告，在此列出并**附上理由与到期时间**，例如：
+    # { id = "RUSTSEC-0000-0000", reason = "无可利用路径，等上游 0.3.x 修复（复审：2026-12-31）" },
+]
+
+[licenses]
+version = 2
+# 显式清单，**不用**「所有 OSI 认可的许可证都放行」那种写法。
+# 后者的代价是：将来任何一个新依赖带着一份 OSI 认可的 copyleft 许可证进来时，
+# 构建仍然是绿的。清单式配置让那件事变成一次必须有人过目的失败。
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    # `r-efi`（Windows 上的 UEFI 支持表）是 LGPL-2.1-or-later。
+    # 它与本项目的 LGPL-3.0-or-later 兼容：LGPL-3.0 第 3 条明确允许把
+    # 「更早版本的 LGPL」升级到本版本。
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "MIT",
+    "MIT-0",
+    # uniffi 全家与 Gobley 均为 MPL-2.0（文件级 copyleft，与 LGPL 兼容）。
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# 遇到清单外的许可证时给出明确失败，而不是静默放过。
+confidence-threshold = 0.9
+
+# 白名单会预先为后续要引入的栈放行一批许可证，因此当前必然有一些条目尚未被任何
+# 依赖用到。这不代表配置有问题，故把「白名单条目未命中」降级为允许。
+unused-allowed-license = "allow"
+
+# 若将来某个依赖的许可证无法被自动识别（例如自带 LICENSE 文件但 SPDX 声明缺失），
+# 在此逐条澄清它**实际**的许可证，而不是把可疑许可证整个加进 allow 清单：
+#
+# [[licenses.clarify]]
+# crate = "某个crate"
+# expression = "MIT"
+# license-files = [{ path = "LICENSE", hash = 0x0000_0000 }]
+
+[bans]
+multiple-versions = "warn"
+# 同一依赖出现多个版本时给出警告（crypto crate 尤其重要：
+# 两个版本的 `aes` 可能意味着一个未打补丁）。
+wildcards = "deny"
+# 允许不带版本约束的 **path 依赖**。
+#
+# 本 crate 以 `qualia2fa-core = { path = "Core" }` 依赖核心库。path 依赖写版本号
+# 是没有意义的（Cargo 会忽略它），因此这个「通配符」是 path 依赖的固有形态，
+# 不是疏忽。这个开关只放行 path 依赖；从 crates.io 引入 `foo = "*"` 仍然会被拒绝。
+allow-wildcard-paths = true
+#
+# 已知的重复版本：`syn` 2.0.119 与 3.0.7 并存（`uniffi` 的宏链路各自钉在不同的
+# 大版本上）。这是**警告**不是失败，且两版都是过程宏依赖、不进产物，因此不处理。
+# 记在这里是为了让下次看到这条警告的人知道它已经被看过，而不是漏了。
+# 明确禁止的 crate 及其理由（见 TODO.md §4.2）。
+deny = [
+    # 上游 PQClean 已归档；RUSTSEC-2026-0164 标记为不再维护。
+    { name = "pqcrypto" },
+    { name = "pqcrypto-kyber" },
+    { name = "pqcrypto-dilithium" },
+    # AVX2 后端跳过 Fujisaki–Okamoto 隐式拒绝，破坏 CCA 证明。
+    { name = "pqc_kyber" },
+    { name = "cosmian_kyber" },
+    # 混合 KEM 为 pre-verification 且实现旧草案；10 个月 21 条公告。
+    { name = "libcrux-kem" },
+    { name = "libcrux-aesgcm" },
+    # CPace：Rust 生态无可用实现。
+    { name = "cpace" },
+    { name = "pake-cpace" },
+    # 已并入 `aes`。
+    { name = "aes-soft" },
+    { name = "aesni" },
+    # `iroh` 从 1.0 起内置了 RFC 10024 的 X25519MLKEM768（见 TODO.md D8），
+    # 而这个 crate 是同一件事的**旧**做法，并且会与 `rustls` 的 KEM 组合选择
+    # 打架（重复注册同一个命名组）。禁掉它，免得后人照着旧文档「补上 PQ 支持」。
+    { name = "rustls-post-quantum" },
+]
+
+# 说明：`anyhow` 不在禁令里。它是库 API 风格问题（库公共签名用 thiserror），
+# 由 code review 把关；写进依赖黑名单会波及开发依赖与构建脚本，得不偿失。
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# 允许 git 依赖留空：本项目当前不依赖任何 git 源。
+allow-git = []
