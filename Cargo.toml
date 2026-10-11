@@ -1,0 +1,61 @@
+[package]
+name = "qualia2fa-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Qualia2FA 的 FFI 层：把 qualia2fa-core 暴露为 UniFFI 绑定，供 Kotlin/Swift 等调用"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/QiuShui1012/Qualia2FA-FFI"
+readme = "README.md"
+publish = false
+
+# ⚠️ 本 crate **不能** 加 `#![forbid(unsafe_code)]`。
+#
+# `uniffi::setup_scaffolding!()` 在当前 crate 内展开 FFI 边界所需的 unsafe 代码
+# （裸指针解引用、`catch_unwind`、字符串所有权转移）。这是不可协商的：FFI 边界
+# 本身就是 unsafe 的，安全性由 UniFFI 的生成代码与我们的 `Result` 返回约定来保证。
+#
+# 安全边界因此划在 crate 之间而非模块之间：
+#   - qualia2fa-core：无 I/O、无 unsafe（`forbid(unsafe_code)`）、可独立审计
+#   - qualia2fa-ffi ：唯一允许 unsafe 的地方，且只应包含「搬运」逻辑
+# 审查本仓库时，注意力应集中在「有没有把核心的逻辑搬到这里来」——
+# 任何加密或解析逻辑出现在本 crate 里都是设计倒退。
+[lints.rust]
+unsafe_code = "warn"
+
+[lib]
+# cdylib 供 JVM（JNA）/Android/iOS 动态加载；staticlib 供 iOS 静态链接与
+# 需要把整个库塞进单一产物的场景。两者都产出，由各平台按需取用。
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+qualia2fa-core = { path = "../Core" }
+
+# 用于 `FfiError` 的 `Display` 与 `std::error::Error` 实现。
+# 与核心同一个 major（2.0.21），不会引入重复版本。
+thiserror = "2"
+
+# UniFFI 版本策略（见 TODO.md §4.4）：
+#
+# 上游最新是 0.32.2，但我们**刻意停在 0.29.x**——端的绑定生成器 Gobley
+# 强制 `uniffi = "0.29.4"`，Rust 侧与 Kotlin 侧的脚手架必须同版本，否则
+# 生成的序列化格式不匹配。
+#
+# 取 `0.29`（等价 `^0.29`，即 >=0.29.0 <0.30.0）而非写死 `=0.29.4`：
+# 0.29.5 已发布（2025-11-14，含修复），同 minor 内 semver 兼容。
+# 这样既能吃到 0.29 线的补丁，又不会跨到 0.30。
+#
+# `cli` 特性提供 `uniffi::uniffi_bindgen_main`，供 `src/bin/uniffi-bindgen.rs`
+# 使用。它**必须在 `[dependencies]` 而非 `[dev-dependencies]`**：
+# dev-dependencies 的特性只对 test/example/bench 目标生效，对 `src/bin/` 下的
+# 二进制**不生效**——放在 dev 段会导致 `cargo build --bin uniffi-bindgen` 时
+# uniffi 以 `features=cargo-metadata,default` 编译，`uniffi_bindgen_main`
+# 找不到（实测报 E0425）。
+#
+# 代价是 clap/camino 进入本 crate 的依赖树，但它们**只被那个生成绑定的二进制
+# 使用**，不会被链接进 cdylib/staticlib，因此不影响端侧产物的体积。
+uniffi = { version = "0.29", features = ["cli"] }
+
+[dev-dependencies]
+# 目前无额外开发依赖：绑定生成所需的 CLI 特性已在上面的 `[dependencies]`。
+# 单元测试只用到 `uniffi::Record`/`Enum`/`Error` 派生与 `setup_scaffolding!`，
+# 都在默认特性内。

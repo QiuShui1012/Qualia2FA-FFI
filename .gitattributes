@@ -1,0 +1,11 @@
+# 统一为 LF，避免在 Windows 上签出 CRLF 导致许可证正文与生成绑定出现
+# 无意义的整文件差异。
+* text=auto eol=lf
+
+# 故意的例外：`.dll`/`.so`/`.dylib` 等二进制（当前不入库，仅供将来参考）
+*.dll binary
+*.so binary
+*.dylib binary
+*.lib binary
+*.a binary
+*.pdb binary

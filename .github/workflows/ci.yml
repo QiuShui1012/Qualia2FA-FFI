@@ -1,0 +1,101 @@
+name: CI
+
+# 说明：本仓库根目录是 `FFI/`（crate `qualia2fa-ffi`），所有 job 都在仓库根执行。
+#
+# 本仓库的关键职责是「边界」而非密码学逻辑，因此 CI 的重点与 Core 不同：
+#   1. 确认 FFI 层没有把核心逻辑搬进来（靠人工审查，CI 只能保证它能编译并通过测试）
+#   2. 确认绑定生成仍然可用——绑定生成失败会让端侧无法构建，
+#      而那要到端侧编译时才会暴露，代价很高
+#   3. 确认 unsafe 面没有无声扩大（`unsafe_code = "warn"`，CI 用 -D warnings 上升为错误）
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── 第一关：格式、lint、测试 ────────────────────────────────────────────
+  check:
+    name: fmt + clippy + test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 注意：本仓库 path-depends 到 `../Core`（即 `qualia2fa-core`）。
+      # CI 上 `../Core` 不存在，因此必须以 git submodule 的方式提供。
+      # 端侧（UI 仓库）把本仓库当 submodule 引入时，同一路径由 submodule 填充；
+      # 这里则用一个显式检出的兄弟目录来满足它，路径必须与 Cargo.toml 一致。
+      - name: 取出 qualia2fa-core（满足 ../Core 路径依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: QiuShui1012/Qualia2FA-Core
+          path: Core
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` 会把 `unsafe_code = "warn"` 变成硬错误：
+      # 任何新增的 unsafe 都必须在代码审查中被显式讨论，不能悄悄混进来。
+      - name: cargo clippy（警告视为错误）
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo doc（警告视为错误）
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # ── 第二关：绑定生成必须仍然可用 ────────────────────────────────────────
+  # 这一关是端侧构建的前置条件。若绑定生成坏了，端侧会在自己仓库里报错，
+  # 定位成本远高于在这里挡住。
+  bindgen:
+    name: 绑定生成（Kotlin / Swift）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取出 qualia2fa-core
+        uses: actions/checkout@v4
+        with:
+          repository: QiuShui1012/Qualia2FA-Core
+          path: Core
+
+      - name: 构建库与绑定生成器
+        run: cargo build --locked --bin uniffi-bindgen
+
+      - name: 生成 Kotlin 绑定
+        shell: pwsh
+        run: |
+          # uniffi-bindgen 内部会调用 `cargo metadata`，必须在仓库根执行
+          cargo run --bin uniffi-bindgen -- generate `
+            --library target/debug/qualia2fa_ffi.dll `
+            --language kotlin --out-dir "$env:RUNNER_TEMP/bindings-kotlin"
+          if (-not (Test-Path "$env:RUNNER_TEMP/bindings-kotlin/qualia2fa_ffi.kt")) {
+            throw "未生成 Kotlin 绑定文件"
+          }
+          # 关键：绑定的 package 名是端侧 import 的依据，改了会直接破坏端侧编译
+          $kt = Get-Content "$env:RUNNER_TEMP/bindings-kotlin/qualia2fa_ffi.kt" -Raw
+          if ($kt -notmatch 'package uniffi\.qualia2fa_ffi') {
+            throw "生成的 Kotlin 绑定 package 名不是 uniffi.qualia2fa_ffi"
+          }
+
+      - name: 生成 Swift 绑定
+        shell: pwsh
+        run: |
+          cargo run --bin uniffi-bindgen -- generate `
+            --library target/debug/qualia2fa_ffi.dll `
+            --language swift --out-dir "$env:RUNNER_TEMP/bindings-swift"
+          if (-not (Test-Path "$env:RUNNER_TEMP/bindings-swift")) {
+            throw "未生成 Swift 绑定目录"
+          }

@@ -1,0 +1,26 @@
+# Rust 构建产物
+/target
+
+# 端侧绑定产物**不入库**。
+#
+# 绑定是从本 crate 的接口定义生成的派生物，应由端侧构建流程在编译前生成。
+# 一旦入库，就会立刻出现「绑定与接口定义不同步」的问题：改了 Rust 侧签名却
+# 忘了重新生成，编译期不报错、运行期才崩。让它始终可重新生成，才是唯一可靠
+# 的做法。生成命令见 README。
+/bindings/
+/bindings-swift/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.iml
+
+# 操作系统
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 本地环境与密钥（严禁提交任何 2FA 密钥材料）
+.env
+*.local.toml
+secrets/
