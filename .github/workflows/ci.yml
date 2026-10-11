@@ -30,11 +30,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 注意：本仓库 path-depends 到 `../Core`（即 `qualia2fa-core`）。
-      # CI 上 `../Core` 不存在，因此必须以 git submodule 的方式提供。
-      # 端侧（UI 仓库）把本仓库当 submodule 引入时，同一路径由 submodule 填充；
-      # 这里则用一个显式检出的兄弟目录来满足它，路径必须与 Cargo.toml 一致。
-      - name: 取出 qualia2fa-core（满足 ../Core 路径依赖）
+      # 注意：本仓库以 `path = "Core"` 依赖核心库（见 Cargo.toml 里的说明——
+      # 路径**不能**带 `../` 前缀，那种写法解析到的是外层仓库之上，CI 上不存在）。
+      #
+      # 因此这里把核心检出到**本仓库内**的 `Core/`。这与本地布局一致：
+      # 端侧把本仓库当 submodule 引入时，同一位置由 `Main/Core` 提供。
+      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: QiuShui1012/Qualia2FA-Core
@@ -65,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 取出 qualia2fa-core
+      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: QiuShui1012/Qualia2FA-Core
@@ -81,13 +82,23 @@ jobs:
           cargo run --bin uniffi-bindgen -- generate `
             --library target/debug/qualia2fa_ffi.dll `
             --language kotlin --out-dir "$env:RUNNER_TEMP/bindings-kotlin"
-          if (-not (Test-Path "$env:RUNNER_TEMP/bindings-kotlin/qualia2fa_ffi.kt")) {
+          # 产物**不**直接在 out-dir 下，而是按 package 名分层：
+          #   <out-dir>/uniffi/qualia2fa_ffi/qualia2fa_ffi.kt
+          # 因此必须递归查找，不能假设它在顶层。
+          $ktFile = Get-ChildItem "$env:RUNNER_TEMP/bindings-kotlin" -Recurse -Filter 'qualia2fa_ffi.kt' |
+                    Select-Object -First 1
+          if (-not $ktFile) {
             throw "未生成 Kotlin 绑定文件"
           }
+          Write-Host "生成: $($ktFile.FullName) ($($ktFile.Length) B)"
           # 关键：绑定的 package 名是端侧 import 的依据，改了会直接破坏端侧编译
-          $kt = Get-Content "$env:RUNNER_TEMP/bindings-kotlin/qualia2fa_ffi.kt" -Raw
+          $kt = Get-Content $ktFile.FullName -Raw
           if ($kt -notmatch 'package uniffi\.qualia2fa_ffi') {
             throw "生成的 Kotlin 绑定 package 名不是 uniffi.qualia2fa_ffi"
+          }
+          # 端侧靠 JNA 加载动态库，这条保证 JVM 路线的前提仍然成立
+          if ($kt -notmatch 'import com\.sun\.jna\.') {
+            throw "生成的 Kotlin 绑定未使用 JNA，JVM 路线的前提已不成立"
           }
 
       - name: 生成 Swift 绑定
@@ -96,6 +107,14 @@ jobs:
           cargo run --bin uniffi-bindgen -- generate `
             --library target/debug/qualia2fa_ffi.dll `
             --language swift --out-dir "$env:RUNNER_TEMP/bindings-swift"
-          if (-not (Test-Path "$env:RUNNER_TEMP/bindings-swift")) {
-            throw "未生成 Swift 绑定目录"
+          $sw = Get-ChildItem "$env:RUNNER_TEMP/bindings-swift" -Recurse -File -ErrorAction SilentlyContinue
+          if (-not $sw) {
+            throw "未生成 Swift 绑定产物"
           }
+          # Swift 侧由三件套组成，缺任何一件都无法被 Xcode 工程引用
+          foreach ($ext in @('.swift', '.h', '.modulemap')) {
+            if (-not ($sw | Where-Object { $_.Name -like "*$ext" })) {
+              throw "Swift 绑定缺少 $ext 产物"
+            }
+          }
+          $sw | ForEach-Object { Write-Host "生成: $($_.Name) ($($_.Length) B)" }

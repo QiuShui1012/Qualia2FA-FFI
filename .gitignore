@@ -10,6 +10,10 @@
 /bindings/
 /bindings-swift/
 
+# 核心库目录。`Cargo.toml` 以 `path = "Core"` 依赖它，该目录由上层以 submodule
+# 提供（CI 中则由 workflow 显式检出），不属于本仓库的内容。
+/Core/
+
 # 编辑器 / IDE
 .vscode/
 .idea/
