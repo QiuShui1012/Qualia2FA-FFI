@@ -30,29 +30,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 注意：本仓库以 `path = "Core"` 依赖核心库（见 Cargo.toml 里的说明——
-      # 路径**不能**带 `../` 前缀，那种写法解析到的是外层仓库之上，CI 上不存在）。
+      # 本仓库以 `path = "Core"` 依赖核心库，因此 CI 必须把核心检出到**本仓库内**
+      # 的 `Core/`。
       #
-      # 因此这里把核心检出到**本仓库内**的 `Core/`。这与本地布局一致：
-      # 端侧把本仓库当 submodule 引入时，同一位置由 `Main/Core` 提供。
-      # 本 crate 以 `path = "../Core"` 与 `path = "../QualiaDeviceIdentityKit"`
-      # 依赖两个**同级**仓库，因此 CI 必须把它们都检出到同级位置。
+      # # 为什么是嵌套而不是同级
       #
-      # 这里刻意**保留** `../` 前缀：扁平布局下 Core 与 DIK 都是本仓库的邻居，
-      # 而「相对工作区根解析」这条规则让本地与 CI 的布局完全一致。先用嵌套
-      # submodule（`path = "Core"`）试过，那条路会让同一个物理目录被两处用不同
-      # 相对路径引用，Cargo 报 `package collision in the lockfile`。
-      - name: 取出 qualia2fa-core（满足 path = "../Core" 依赖）
+      # `actions/checkout` **拒绝**检出到工作区之外的路径：
+      #
+      #     ##[error]Repository path 'D:\a\Qualia2FA-FFI\Core'
+      #               is not under 'D:\a\Qualia2FA-FFI\Qualia2FA-FFI'
+      #
+      # 因此 FFI 这里的上级只能走嵌套。这与本地一致：端侧把本仓库当 submodule
+      # 引入时，同一位置由 `Main/FFI/Core` 提供。
+      #
+      # 设备身份库（`qualia-dik`）曾经也是嵌套的，两条嵌套会让同一个物理目录被两个
+      # 相对路径引用、Cargo 报 `package collision in the lockfile`。它发布到
+      # crates.io 之后改成版本号依赖，碰撞随之消失——**这是「独立子库要发布」这条
+      # 规则最实在的收益**。
+      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: Qualia2FA/Qualia2FA-Core
-          path: ../Core
-
-      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
-        uses: actions/checkout@v4
-        with:
-          repository: Qualia2FA/QualiaDeviceIdentityKit
-          path: ../QualiaDeviceIdentityKit
+          path: Core
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -79,24 +78,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 本 crate 以 `path = "../Core"` 与 `path = "../QualiaDeviceIdentityKit"`
-      # 依赖两个**同级**仓库，因此 CI 必须把它们都检出到同级位置。
-      #
-      # 这里刻意**保留** `../` 前缀：扁平布局下 Core 与 DIK 都是本仓库的邻居，
-      # 而「相对工作区根解析」这条规则让本地与 CI 的布局完全一致。先用嵌套
-      # submodule（`path = "Core"`）试过，那条路会让同一个物理目录被两处用不同
-      # 相对路径引用，Cargo 报 `package collision in the lockfile`。
-      - name: 取出 qualia2fa-core（满足 path = "../Core" 依赖）
+      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
           repository: Qualia2FA/Qualia2FA-Core
-          path: ../Core
-
-      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
-        uses: actions/checkout@v4
-        with:
-          repository: Qualia2FA/QualiaDeviceIdentityKit
-          path: ../QualiaDeviceIdentityKit
+          path: Core
 
       # 必须用 `--all-targets`，不能写成 `--bin uniffi-bindgen`：
       # 后者**只构建那个二进制**，不会产出 cdylib。而绑定生成器要读的正是

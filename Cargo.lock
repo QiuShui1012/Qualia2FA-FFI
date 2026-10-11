@@ -700,6 +700,8 @@ dependencies = [
 [[package]]
 name = "qualia-dik"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680916be8b2cc19dd33b26d329946ef61a351a2dd0596f3fd7220bfa88b42d4e"
 dependencies = [
  "p256",
  "sha2",

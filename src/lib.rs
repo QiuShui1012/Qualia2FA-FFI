@@ -37,8 +37,8 @@ uniffi::setup_scaffolding!();
 
 use std::sync::Arc;
 
-use qualia2fa_core::auth;
 use qualia_dik::{DevicePublicKey, DeviceSignature};
+use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::recovery::KdfParams;
@@ -835,11 +835,9 @@ fn ffi_to_core_error(source: FfiError) -> Error {
 fn kind_to_core_error(kind: &str) -> Error {
     match kind {
         "device_key_missing" => Error::DeviceKeyMissing,
-        "device_signature_invalid" => Error::Device(
-            qualia_dik::Error::DeviceSignatureInvalid {
-                reason: "端侧签名失败",
-            },
-        ),
+        "device_signature_invalid" => Error::Device(qualia_dik::Error::DeviceSignatureInvalid {
+            reason: "端侧签名失败",
+        }),
         "secure_store_write_failed" => Error::SecureStoreWriteFailed {
             reason: "端侧密钥库拒绝写入",
         },

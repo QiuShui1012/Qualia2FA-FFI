@@ -39,7 +39,7 @@ crate-type = ["cdylib", "staticlib"]
 # 不带前缀的 `Core` 则稳定地解析到「仓库内的 Core/」，在本地与 CI 上一致：
 #   - 本地：`Qualia2FA/Main/Core`（本仓库作为 submodule 被引入后）
 #   - CI  ：`<仓库根>/Core`（由 .github/workflows/ci.yml 显式检出）
-qualia2fa-core = { path = "../Core" }
+qualia2fa-core = { path = "Core" }
 
 # 设备身份：`DevicePublicKey` / `DeviceSignature` 的类型与解析都在这里。
 #
@@ -50,9 +50,12 @@ qualia2fa-core = { path = "../Core" }
 # **再导出**它们以便下游少写一个依赖；在 FFI 这层，回调的签名直接用原类型更清楚——
 # 再导出是给「只依赖 Core 的调用方」用的便利，不是要求。
 #
-# 路径与 Core 用的**同一条**（`../QualiaDeviceIdentityKit`），因为它与 Core 是同级
-# 目录。这一点必须在 CI 里成立：workflow 会把两个仓库都检出到同级位置。
-qualia-dik = { path = "../QualiaDeviceIdentityKit" }
+# 用**版本号**，与 Core 一致。它已经发布到 crates.io（`qualia-dik 0.1.0`）。
+#
+# 版本号是唯一能让本地、CI 与第三方消费者看到同一份源码的写法：路径依赖会让同一个
+# 物理目录被不同的相对路径引用而变成两个包，而把上游检出到工作区**之外**在
+# GitHub Actions 上会被 `actions/checkout` 拒绝。
+qualia-dik = "0.1"
 
 # 用于 `FfiError` 的 `Display` 与 `std::error::Error` 实现。
 # 与核心同一个 major（2.0.21），不会引入重复版本。
@@ -90,16 +93,3 @@ uniffi = { version = "0.29", features = ["cli"] }
 # 这两项**只进测试目标**，不会链接进 cdylib/staticlib。
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.11"
-# 声明本仓库是一个工作区（只含本 crate）。
-#
-# # 它为什么必需
-#
-# 带 `../` 前缀的路径依赖以**工作区根目录**为基准解析。不声明时工作区根就是本清单
-# 所在目录（因为这里没有别的清单文件），本地与 CI 恰好一致；但当 `Core/` 曾被当作
-# 嵌套 submodule 时，那种「恰好」会让同一个物理目录被两处用不同相对路径引用，Cargo
-# 于是把它们当成两个包（`package collision in the lockfile`）。
-#
-# 写下来之后，「本目录是工作区根、`../Core` 与 `../QualiaDeviceIdentityKit` 都是
-# 同级仓库」成为一条明确的事实，而不是由目录里恰好没有什么文件所决定的巧合。
-[workspace]
-resolver = "3"
