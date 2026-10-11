@@ -72,8 +72,12 @@ jobs:
           repository: QiuShui1012/Qualia2FA-Core
           path: Core
 
+      # 必须用 `--all-targets`，不能写成 `--bin uniffi-bindgen`：
+      # 后者**只构建那个二进制**，不会产出 cdylib。而绑定生成器要读的正是
+      # `target/debug/qualia2fa_ffi.dll`，于是它会报：
+      #     failed to open file `target/debug/qualia2fa_ffi.dll`
       - name: 构建库与绑定生成器
-        run: cargo build --locked --bin uniffi-bindgen
+        run: cargo build --locked --all-targets
 
       - name: 生成 Kotlin 绑定
         shell: pwsh
@@ -82,20 +86,23 @@ jobs:
           cargo run --bin uniffi-bindgen -- generate `
             --library target/debug/qualia2fa_ffi.dll `
             --language kotlin --out-dir "$env:RUNNER_TEMP/bindings-kotlin"
+
           # 产物**不**直接在 out-dir 下，而是按 package 名分层：
           #   <out-dir>/uniffi/qualia2fa_ffi/qualia2fa_ffi.kt
           # 因此必须递归查找，不能假设它在顶层。
-          $ktFile = Get-ChildItem "$env:RUNNER_TEMP/bindings-kotlin" -Recurse -Filter 'qualia2fa_ffi.kt' |
-                    Select-Object -First 1
+          $ktFile = Get-ChildItem -Path "$env:RUNNER_TEMP/bindings-kotlin" `
+                    -Recurse -Filter 'qualia2fa_ffi.kt' | Select-Object -First 1
           if (-not $ktFile) {
             throw "未生成 Kotlin 绑定文件"
           }
           Write-Host "生成: $($ktFile.FullName) ($($ktFile.Length) B)"
+
           # 关键：绑定的 package 名是端侧 import 的依据，改了会直接破坏端侧编译
-          $kt = Get-Content $ktFile.FullName -Raw
+          $kt = Get-Content -Path $ktFile.FullName -Raw
           if ($kt -notmatch 'package uniffi\.qualia2fa_ffi') {
             throw "生成的 Kotlin 绑定 package 名不是 uniffi.qualia2fa_ffi"
           }
+
           # 端侧靠 JNA 加载动态库，这条保证 JVM 路线的前提仍然成立
           if ($kt -notmatch 'import com\.sun\.jna\.') {
             throw "生成的 Kotlin 绑定未使用 JNA，JVM 路线的前提已不成立"
