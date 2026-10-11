@@ -70,6 +70,8 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 
 ## 接口
 
+### 验证码
+
 | 函数 | 说明 |
 |---|---|
 | `parse_otpauth_uri` | 解析 `otpauth://` URI |
@@ -85,18 +87,114 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 **时间一律由调用方传入。** 核心不读时钟，只有时间作为参数传入，RFC 6238 的
 测试向量才能被确定性地验证。端侧应传系统时钟的 Unix 秒数。
 
+### 保险库（`FfiVault`）
+
+条目本身由 `FfiVault` 持有，**主密钥留在 Rust 侧**。「打开 → 列条目 → 改条目 →
+存回文件」这条最常见的路径上，主密钥一次都不会以字节形式出现在 Kotlin/Swift 里。
+
+| 方法 | 说明 |
+|---|---|
+| `FfiVault.register(keys, store, label)` | 生成主密钥、取得设备身份、写入平台密钥库 |
+| `FfiVault.open(store, data)` | 用密钥库里的主密钥打开保险库文件 |
+| `FfiVault.fromMasterKey(bytes)` | 用已有主密钥建立空保险库（登录/恢复之后用） |
+| `entryCount` / `isEmpty` / `tombstoneCount` | 计数 |
+| `entries` / `entry(id)` | 读取条目（**顺序不保证**，列表请自行排序） |
+| `addEntry(entry, now)` → `id` | 新增 |
+| `updateEntry(entry, now)` | 修改（**标识不变、不留墓碑**） |
+| `removeEntry(id, now)` → `Bool` | 删除（留墓碑） |
+| `serialize` | 序列化，供端侧**原子地**落盘 |
+| `totpFor` / `hotpFor` / `steamGuardFor` | 直接按条目算验证码 |
+| `exportRecoveryKey(passphrase, …)` | 导出恢复密钥文件 |
+
+`updateEntry` 与 `removeEntry` 的区别不只是语义：修改保留条目标识，删除留下墓碑。
+两者在另一台设备上被读成完全不同的操作，因此**不要**用「删除 + 新增」实现修改。
+
+### 注册与登录
+
+```kotlin
+// 新设备注册
+val vault = FfiVault.register(deviceKeys, secureStore, "qualia2fa-device")
+
+// 老设备（已登录）：出示二维码
+val login = FfiLogin.begin()
+showQrCode(login.payload())
+
+// 新设备：扫码、发请求、拿回应答后完成
+val joiner = FfiJoiner.fromQr(scannedText, "qualia2fa-device")
+val request = joiner.request(deviceKeys)
+// …把 request 交给老设备…
+val reply = login.authorize(oldVault, request)   // 界面在这里必须先让用户确认
+val masterKey = joiner.complete(reply, deviceKeys, secureStore)
+```
+
+| 方法 | 说明 |
+|---|---|
+| `FfiLogin.begin()` / `payload()` | 发起登录，取得二维码文本 |
+| `FfiLogin.authorize(vault, msg1)` | 授权（**调用即交出主密钥**，界面须先确认） |
+| `FfiLogin.joinerDeviceId()` | 请求方的设备标识，显示给用户核对 |
+| `FfiJoiner.fromQr(text, label)` | 扫码建立会话 |
+| `FfiJoiner.request(keys)` | 发出请求（幂等） |
+| `FfiJoiner.identity()` | 本机身份，完成之前才有值 |
+| `FfiJoiner.complete(msg2, keys, store)` | 验证应答、取回主密钥、写入密钥库 |
+
+一次登录只能完成一次。第二次调用报的是**与「应答是伪造的」相同的错误**，这是故意
+的——单独报「已经用过了」等于告诉重放者他被认出来了。端侧文案也应保持笼统。
+
+### 恢复密钥
+
+| 函数 | 说明 |
+|---|---|
+| `FfiVault.exportRecoveryKey` | 设备已解锁时导出（主密钥不过边界） |
+| `exportRecoveryKeyFromMaster` | 只有主密钥字节时导出 |
+| `importRecoveryKey(file, passphrase, store)` | 导入并写入密钥库，返回主密钥 |
+| `storeMasterKey(bytes, store)` | 单独保存主密钥 |
+
+KDF 参数（`memory_kib` / `iterations` / `parallelism`）传 `null` 用推荐值
+（64 MiB / 3 次 / 1 路）。**不要为了「快」调低**：导出是一次性开销，而拿到文件的
+攻击者是离线暴力破解，参数调低直接削弱用户最后一道防线。
+
+### 挑战-应答
+
+用来证明「对方持有主密钥」而不把主密钥交出去。它与登录不同：登录传输密钥，它只做
+证明。**三步都要走完**，漏掉第三步等于只做了一半认证。
+
+```kotlin
+val verifier = FfiVerifier.begin()
+val responder = FfiResponder.accept(verifier.challenge())
+val response = responder.respond(vault, label, deviceKeys)
+verifier.verify(response, vault)                  // 第二步：主密钥确实对得上
+responder.confirm(vault, verifier.sessionId()!!, verifier.confirmation()!!)  // 第三步
+```
+
+> **空保险库判定不了主密钥对错。** 主密钥只参与每条记录的加密，文件头里没有它的
+> 校验值，因此一个**条目为空**的文件对任何 32 字节密钥都能打开。端侧不要把「打开
+> 成功」当成「密钥正确」——需要确认时用挑战-应答。
+
 ## 错误处理
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 
 | 变体 | 含义 |
 |---|---|
-| `InputTooLong` | 输入超过边界上限（种子 2048 字符 / URI 4096 字符） |
+| `InputTooLong` | 输入超过边界上限 |
 | `Core` | 核心返回的错误，结构化为 `FfiCoreError { kind, message }` |
 
-`kind` 是**稳定的机器可读标识**（如 `secret_empty`、`uri_missing_secret`），
+`kind` 是**稳定的机器可读标识**（如 `secret_empty`、`vault_entry_not_found`），
 端侧据此分流 UI；`message` 仅供展示与日志。这些字符串属于公开接口：**可以新增，
 但既有值不得改名**。
+
+有几组 `kind` 是刻意分开的，合并它们会造成用户可见的错误：
+
+| kind | 不要与它合并 | 合并的后果 |
+|---|---|---|
+| `device_not_registered` | `vault_decryption_failed` | 用户被引导重新注册，原有条目永久丢失 |
+| `vault_entry_not_found` | 「保险库为空」 | 显示空列表，而用户刚才还在看条目 |
+| `recovery_authentication_failed` | `recovery_file_malformed` | 用户反复试口令，而问题不在口令 |
+| `pairing_authentication_failed` | 任何更具体的错误 | 给攻击者一个「差一点就成功」的预言机 |
+
+`pairing_authentication_failed` 覆盖密文被改、会话对不上、应答来自另一次登录等
+多种成因，**这是刻意的**。端侧文案应当保持笼统（「配对失败，请重新扫码」），不要
+试图从它推断更具体的原因。
 
 核心是 `#[non_exhaustive]` 的，未来会新增错误变体，因此端侧**必须对未知
 `kind` 有兜底分支**：
@@ -123,6 +221,19 @@ try {
 > 不受核心 `secrecy` 的擦除保护，且可能被 GC 复制、进字符串常量池。这是托管语言
 > 的固有限制。端侧应约定：种子的 Base32 只在必要作用域内存在，用完立即丢弃，
 > **绝不写入日志或持久化**。
+
+**主密钥**同理但更进一步：它正常路径下**根本不过边界**。`FfiVault` 在 Rust 侧持有
+它，读条目、改条目、算验证码、序列化都在 Rust 内完成。只有两个构造入口需要端侧交出
+或接收它：
+
+- `FfiVault.fromMasterKey(bytes)` / `storeMasterKey(bytes, store)`：登录或恢复之后，
+  端侧手里已经有主密钥字节。
+- `FfiJoiner.complete(...)` / `importRecoveryKey(...)`：返回主密钥字节，供端侧立刻
+  建一个 `FfiVault` 或交给密钥库。
+
+拿到之后端侧应当**立刻丢掉**那些字节。`FfiDeviceKeys` / `FfiSecureStore` 两个回调
+之所以用字节而不是结构体，正是因为主密钥的永久归宿是平台密钥库，而只有端侧能访问
+它——把整个密钥库抽象搬进 Rust 会让每个平台的 `unsafe` 跟着进来。
 
 ## 参与贡献
 

@@ -704,7 +704,9 @@ dependencies = [
 name = "qualia2fa-ffi"
 version = "0.1.0"
 dependencies = [
+ "p256",
  "qualia2fa-core",
+ "sha2",
  "thiserror",
  "uniffi",
 ]
