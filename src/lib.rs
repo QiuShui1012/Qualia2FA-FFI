@@ -184,6 +184,10 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::VaultEntryNotFound => "vault_entry_not_found",
         Error::VaultDuplicateField { .. } => "vault_duplicate_field",
         Error::VaultCorrupt => "vault_corrupt",
+        // 与 `vault_decryption_failed` 严格区分：**这个是结构问题（检查值长度不对，
+        // 文件被截断或构造坏了），那个是密钥不对或文件被改过**。合并两者会让「文件
+        // 不可信」被误报成「你的密钥错了」，用户于是去比对密钥，而问题不在那里。
+        Error::VaultBadKeyCheck => "vault_bad_key_check",
         Error::VaultInvalidUtf8 => "vault_invalid_utf8",
         // 端侧最需要单独分流的一个：主密钥与文件不匹配。
         Error::VaultDecryptionFailed => "vault_decryption_failed",
@@ -1080,11 +1084,14 @@ impl FfiVault {
     /// 端侧必须区分这两者——前者引导用户去注册/登录，后者要警告数据可能已损坏或
     /// 主密钥被换过。合并处理会让用户在被引导重新注册时永久失去原有条目。
     ///
-    /// # 已知限制：空保险库判定不了主密钥对错
+    /// # 空保险库也能判定主密钥对错
     ///
-    /// 主密钥只参与每条记录的 AEAD，文件头里没有它的校验值。因此一个**条目为空**
-    /// 的文件对任何 32 字节主密钥都能打开。端侧不要把「打开成功」当成「密钥正确」；
-    /// 需要确认时用 [`FfiVerifier`] 的挑战-应答。
+    /// 格式版本 2 在文件末尾放了一个主密钥检查值，因此**条目为空的文件同样能判定**：
+    /// 主密钥不对就返回 [`Error::VaultDecryptionFailed`]，而不是等到用户加进第一条
+    /// 条目才暴露。端侧可以在打开成功后直接把「已解锁」呈现给用户。
+    ///
+    /// **版本 1 的旧文件仍然判定不了**——那份文件里确实没有可判定的信息。需要权威
+    /// 确认时用 [`FfiVerifier`] 的挑战-应答，它不依赖文件内容。
     #[uniffi::constructor]
     pub fn open(store: Arc<dyn FfiSecureStore>, data: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let store = ForeignSecureStore(store);
@@ -1598,9 +1605,11 @@ impl FfiJoiner {
 ///
 /// # 它用在什么场景
 ///
-/// 1. **确认解锁成功**。空保险库判定不了主密钥对错（见 [`FfiVault::open`] 的说明），
-///    而挑战-应答直接证明「对方算得出用主密钥派生的标签」。
-/// 2. **跨设备的身份确认**（后续里程碑）。
+/// 1. **确认解锁成功**。版本 2 的保险库文件本身就能判定主密钥对错（见
+///    [`FfiVault::open`]），因此这条路径主要服务于**版本 1 的旧文件**，以及
+///    「手里只有主密钥、还没有文件」的情形。
+/// 2. **跨设备的身份确认**（后续里程碑）。它与文件内容无关，因此在文件缺失或
+///    损坏时是唯一可用的证明手段。
 ///
 /// # 与配对的区别
 ///
@@ -2068,6 +2077,48 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000;
 
+    /// **空的**保险库也必须能判定主密钥对错。
+    ///
+    /// 这条覆盖的正是格式版本 2 修掉的那个缺口：版本 1 里主密钥只参与每条记录的
+    /// AEAD，而空文件没有记录，于是任何 32 字节密钥都能打开它，界面会显示「已解锁」
+    /// 而密钥其实是错的。
+    ///
+    /// 端侧看到的现象是：`FfiVault.open` 在**一个条目都没有**的文件上也会拒绝错误的
+    /// 主密钥。因此端侧可以把「打开成功」直接当成「已解锁」，不必再补一次挑战-应答。
+    #[test]
+    fn an_empty_vault_rejects_a_wrong_master_key() {
+        let store_a = Arc::new(TestStore::default());
+        let vault_a = FfiVault::register(
+            Arc::new(TestKeys::default()),
+            store_a,
+            "device-a".to_owned(),
+        )
+        .expect("注册应当成功");
+        assert!(vault_a.is_empty(), "前提：这个保险库确实是空的");
+        let data = vault_a.serialize().expect("应当能序列化");
+
+        // 另一台设备，有它自己的一把主密钥。
+        let store_b = Arc::new(TestStore::default());
+        FfiVault::register(
+            Arc::new(TestKeys::default()),
+            store_b.clone(),
+            "device-b".to_owned(),
+        )
+        .expect("注册应当成功");
+
+        // 用 `err()` 而不是 `expect_err`：后者要求 `Ok` 一侧也实现 `Debug`，而
+        // `FfiVault` 刻意不实现它——它的内部只有主密钥与条目，一个打印出来的
+        // `Debug` 输出很容易把秘密材料带进日志。
+        let error = FfiVault::open(store_b, data)
+            .err()
+            .expect("空保险库用错误密钥必须被拒");
+        assert_eq!(
+            error.kind(),
+            "vault_decryption_failed",
+            "必须是「解不开」，而不是「没注册」——两者的界面动作完全不同"
+        );
+    }
+
     /// 注册之后能加条目、能算验证码、能序列化再打开。
     ///
     /// 这条走的是端侧最常走的那条路：注册 → 加条目 → 落盘 → 重新打开 → 读验证码。
@@ -2325,6 +2376,7 @@ mod tests {
             core_error_kind(&Error::VaultCorrupt),
             core_error_kind(&Error::VaultDecryptionFailed),
             core_error_kind(&Error::VaultEntryNotFound),
+            core_error_kind(&Error::VaultBadKeyCheck),
             core_error_kind(&Error::MasterKeyWrongLength {
                 expected: 32,
                 actual: 1,
