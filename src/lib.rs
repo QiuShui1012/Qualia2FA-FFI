@@ -11,16 +11,13 @@
 //! A review of this crate has a single checklist item: **has any core logic been
 //! moved in here?**
 //!
-//! # Why `#![forbid(unsafe_code)]` is not possible
-//!
 //! `uniffi::setup_scaffolding!()` expands the unsafe code the FFI boundary needs
 //! inside this crate (raw pointer dereferences, `catch_unwind`, transfer of string
-//! ownership). The FFI boundary itself is unsafe.
-//!
-//! The safety boundary therefore runs **between crates**: the core is
-//! `forbid(unsafe_code)`, and this crate is the only place allowed to contain
-//! unsafe code, which must stay thin. `Cargo.toml` sets `unsafe_code` to `warn`
-//! rather than `allow` so that any new unsafe code is reported at build time.
+//! ownership), so this crate is not `forbid(unsafe_code)`. The safety boundary runs
+//! **between crates**: the core is `forbid(unsafe_code)`, and this crate is the
+//! only place allowed to contain unsafe code, which must stay thin. `Cargo.toml`
+//! sets `unsafe_code` to `warn` rather than `allow`, so new unsafe code is reported
+//! at build time.
 //!
 //! # Handling of secret material
 //!
@@ -129,21 +126,12 @@ const MAX_QR_TEXT_CHARS: usize = 512;
 
 /// Summary of a core error, carried across the FFI boundary.
 ///
-/// # Why this layer exists instead of the core `Error` itself
-///
-/// UniFFI requires every field of an error enum to implement `Lift`/`Lower`/
-/// `TypeId`. The core's [`Error`] is a `#[non_exhaustive]` rich error enum
-/// (carrying `String`, `usize` and other payloads) and is not a UniFFI type;
-/// marking it as `#[uniffi::Error]` would couple the core to the binding
-/// generator again.
-///
-/// With `#[uniffi(flat_error)]` the variants would cross the boundary as `Display`
-/// text only, leaving the client with one opaque string and **no way to dispatch
-/// the UI by failure reason** (a bad seed asks the user to retype, a zero period is
-/// a program defect, unavailable randomness asks for a retry — three very different
-/// meanings for the user).
-///
-/// This type therefore carries two fields:
+/// The core's [`Error`] is a `#[non_exhaustive]` rich error enum (carrying
+/// `String`, `usize` and other payloads) and is not a UniFFI type: UniFFI requires
+/// every field of an error enum to implement `Lift`/`Lower`/`TypeId`, and with
+/// `#[uniffi(flat_error)]` the variants would cross the boundary as `Display` text
+/// only, leaving the client one opaque string and **no way to dispatch the UI by
+/// failure reason**. This type carries two fields:
 ///
 /// - `kind`: a stable machine-readable identifier the client branches on
 /// - `message`: user-facing text, for display and logs only
@@ -276,12 +264,6 @@ impl FfiError {
     /// require every call site to match on the variant first. This method folds the
     /// boundary's own errors into the same set of identifiers (`input_too_long`),
     /// so the client needs a single `when`.
-    ///
-    /// # Why this is a stable contract
-    ///
-    /// These strings are **part of the interface**: the client dispatches its text
-    /// branches on them. Renaming breaks compatibility, so values may only be
-    /// added.
     #[must_use]
     pub fn kind(&self) -> &str {
         match self {
@@ -865,20 +847,13 @@ impl qualia2fa_core::flow::SecureStore for ForeignSecureStore {
 /// Converts an [`FfiError`] returned by a host-side callback back into a core
 /// error.
 ///
-/// # Why this converts back rather than translates
-///
-/// Almost all errors appearing in these callbacks **are core errors already**:
-/// the host side merely passes them back (for example, a platform key store
-/// reporting unavailable hardware, which corresponds to the core
-/// [`Error::DeviceKeyMissing`]). Wrapping them all in one generic error here
-/// would degrade the failure reason the core receives, and the error handling in
-/// `flow` branches on that reason.
-///
-/// [`FfiError::Core`] is therefore mapped back to a core variant through `kind`.
-/// What cannot be mapped back — the boundary's own [`FfiError::InputTooLong`]
-/// and any kind added later — degrades to [`Error::DeviceKeyMissing`], an honest
-/// description of "the key on this device is unavailable" that does not let the
-/// caller believe everything is fine.
+/// The errors appearing in these callbacks **are core errors already**: the host
+/// side passes them back (for example, a platform key store reporting unavailable
+/// hardware, which corresponds to the core [`Error::DeviceKeyMissing`]), and the
+/// error handling in `flow` branches on that reason. [`FfiError::Core`] is mapped
+/// back to a core variant through `kind`; what cannot be mapped back — the
+/// boundary's own [`FfiError::InputTooLong`] and any kind added later — degrades to
+/// [`Error::DeviceKeyMissing`].
 fn ffi_to_core_error(source: FfiError) -> Error {
     match source {
         FfiError::Core { detail } => kind_to_core_error(&detail.kind),
@@ -914,13 +889,11 @@ fn kind_to_core_error(kind: &str) -> Error {
 /// equivalent** — a vault entry adds a display name, a note and timestamps, and
 /// has no "URI type" field (HOTP is expressed by `counter` being `None`).
 ///
-/// # Why `id` is a string
-///
-/// The core's [`EntryId`](qualia2fa_core::vault::EntryId) is 16 bytes, but the
-/// host side only passes it around and compares it as an opaque identifier
-/// (list item key, naming an entry to delete). A hexadecimal string is used
-/// instead of `Vec<u8>` because in managed languages byte-array equality and
-/// hashing are often by reference, whereas strings have value semantics.
+/// The core's [`EntryId`](qualia2fa_core::vault::EntryId) is 16 bytes; it crosses
+/// the boundary as a 32-character lower-case hexadecimal string, the form the host
+/// side uses as an opaque identifier (list item key, naming an entry to delete).
+/// Strings have value semantics, whereas byte-array equality and hashing in
+/// managed languages are often by reference.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiVaultEntry {
     /// Entry identifier, a 32-character lower-case hexadecimal string.
@@ -1068,12 +1041,10 @@ fn hex_digit(byte: u8) -> Result<u8, FfiError> {
 pub struct FfiVault {
     /// The core vault state, including the master key.
     ///
-    /// # Why `Mutex` rather than a plain `VaultFile`
-    ///
-    /// UniFFI shares exported objects as `Arc<Self>`, and `Arc` grants no
-    /// mutable borrow, so interior state needs a container that offers interior
-    /// mutability. `Mutex` rather than `RefCell` because `Mutex` is
-    /// `Send + Sync`, which UniFFI's `#[Object]` requires.
+    /// UniFFI shares exported objects as `Arc<Self>`, and `Arc` grants no mutable
+    /// borrow, so the state sits behind a container with interior mutability.
+    /// `Mutex` and not `RefCell`: UniFFI's `#[Object]` requires `Send + Sync`, which
+    /// `RefCell` does not provide.
     ///
     /// **The lock granularity is one method call**, and only in-memory work
     /// happens under the lock (hash-table insert and remove, copying entry
@@ -1464,18 +1435,14 @@ pub fn export_recovery_key_from_master(
 /// Recovers the master key from a recovery key file with a passphrase and
 /// **writes it into the platform key store**.
 ///
+/// The write goes through the core `SecureStore` abstraction, so this path and
+/// login share the same ordering guarantees at the storage step.
+///
 /// Returns the 32 bytes of the master key. The host side either passes them to
 /// [`FfiSecureStore::store_master_key`] or drops them, since this function has
-/// already written the store once.
-///
-/// # Why there is both a return value and an internal write
-///
-/// The internal write makes recovery and login behave identically at the storage
-/// step (both go through the core `SecureStore` abstraction, so the ordering
-/// guarantees are the same). The return value lets the host side build an
-/// [`FfiVault`] immediately instead of reading the key store again, and every
-/// read is another hardware access that prompts for biometrics on some
-/// platforms.
+/// already written the store once; building an [`FfiVault`] from the returned bytes
+/// avoids a second key-store read, which is a hardware access that prompts for
+/// biometrics on some platforms.
 ///
 /// # Errors
 ///
@@ -1632,20 +1599,18 @@ impl FfiJoiner {
     /// Establishes a session from the scanned QR code text. `label` is the label
     /// of this device's identity in the platform key store.
     ///
+    /// This step does not send the request; the core keeps `new` and `request` as
+    /// two steps and this layer keeps the same granularity. Sending the request
+    /// needs the device identity, and obtaining it prompts for biometrics on some
+    /// platforms, so the host side can tell the user that a local key is about to
+    /// be created first.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::PairingPayloadMalformed`] when the text is not a valid QR
     /// payload. Note that "not a valid payload" and "valid payload but a
     /// mismatched session" are two different things; the latter only surfaces at
     /// [`FfiJoiner::complete`].
-    ///
-    /// # Why this does not send the request as well
-    ///
-    /// The core keeps `new` and `request` as two steps and this layer keeps the
-    /// same granularity: sending the request needs the device identity, and
-    /// obtaining the identity prompts for biometrics on some platforms. The host
-    /// side may want to tell the user that a local key is about to be created
-    /// before triggering it.
     #[uniffi::constructor]
     pub fn from_qr(text: String, label: String) -> Result<Arc<Self>, FfiError> {
         check_len("qr", &text, MAX_QR_TEXT_CHARS)?;
@@ -1956,14 +1921,11 @@ impl FfiResponder {
 
 /// Builds [`KdfParams`] from the optional host-side values.
 ///
-/// # Why the values come from the host side yet are range-checked here
-///
-/// They do come from the host side (the user can adjust them in the user
-/// interface), but they **also come from someone else's file**: on import the
-/// values are read from a file, and that file is attacker controlled. The core's
-/// `KdfParams::new` bounds both ends, and this function passes its error through
-/// instead of judging on its own, so that there is only one implementation of the
-/// check.
+/// The values come from the host side (the user can adjust them in the user
+/// interface) and, on import, from a file that is attacker controlled. The range
+/// check lives in the core's `KdfParams::new`, which bounds both ends; this
+/// function passes its error through rather than judging on its own, so there is a
+/// single implementation of the check.
 ///
 /// The host side passes `u64` rather than the core's `u32`: UniFFI maps `u32` to
 /// an unsigned type on the Kotlin side, which Kotlin does not have natively. A
