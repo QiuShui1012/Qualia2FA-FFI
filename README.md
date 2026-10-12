@@ -138,6 +138,7 @@ val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 | `FfiJoiner.request(keys)` | 发出请求（幂等） |
 | `FfiJoiner.identity()` | 本机身份，完成之前才有值 |
 | `FfiJoiner.complete(msg2, keys, store)` | 验证应答、取回主密钥、写入密钥库 |
+| `FfiPlatformKeys.open(label)` | 打开平台密钥库里的设备身份（Windows 上是 CNG/TPM，没有 TPM 时是 CNG 软件库）。它把 `qualia-dik` 的实现搬到边界这一侧，host 只需写一层不含判断的转发去实现 `FfiDeviceKeys`；`backend()` 如实报告实际拿到的是哪一种 |
 
 一次登录只能完成一次。第二次调用报的是**与「应答是伪造的」相同的错误**，这是故意
 的——单独报「已经用过了」等于告诉重放者他被认出来了。端侧文案也应保持笼统。

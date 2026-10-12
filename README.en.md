@@ -149,6 +149,7 @@ val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 | `FfiJoiner.request(keys)` | Sends the request (idempotent) |
 | `FfiJoiner.identity()` | This device's identity; has a value only before completion |
 | `FfiJoiner.complete(msg2, keys, store)` | Verifies the reply, retrieves the master key, writes it to the key store |
+| `FfiPlatformKeys.open(label)` | Opens the device identity in the platform key store (CNG/TPM on Windows, the CNG software store without a TPM). It brings the `qualia-dik` implementation to this side of the boundary, so the host only forwards when implementing `FfiDeviceKeys`; `backend()` reports truthfully which of the two it got |
 
 A login can be completed only once. The second call reports **the same error as "the reply
 was forged"**, and that is deliberate — reporting "already used" on its own would tell a
