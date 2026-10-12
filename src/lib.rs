@@ -321,7 +321,7 @@ impl core::fmt::Display for FfiCoreError {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     /// The input exceeds the limit set by this layer.
-    #[error("输入过长：{kind} 上限为 {limit} 字符，实际 {actual} 字符")]
+    #[error("input too long: {kind} limit is {limit} characters, got {actual} characters")]
     InputTooLong {
         /// The restricted input category (`secret` / `uri`).
         kind: String,
@@ -888,10 +888,10 @@ fn kind_to_core_error(kind: &str) -> Error {
     match kind {
         "device_key_missing" => Error::DeviceKeyMissing,
         "device_signature_invalid" => Error::Device(qualia_dik::Error::DeviceSignatureInvalid {
-            reason: "端侧签名失败",
+            reason: "signing failed on the client side",
         }),
         "secure_store_write_failed" => Error::SecureStoreWriteFailed {
-            reason: "端侧密钥库拒绝写入",
+            reason: "the client key store refused the write",
         },
         _ => Error::DeviceKeyMissing,
     }
@@ -1005,7 +1005,7 @@ fn parse_entry_id(text: &str) -> Result<qualia2fa_core::vault::EntryId, FfiError
         return Err(FfiError::Core {
             detail: Error::UriInvalidParameter {
                 name: "entry_id".to_owned(),
-                reason: "必须是 32 个十六进制字符".to_owned(),
+                reason: "must be 32 hexadecimal characters".to_owned(),
             }
             .into(),
         });
@@ -1028,7 +1028,7 @@ fn hex_digit(byte: u8) -> Result<u8, FfiError> {
         _ => Err(FfiError::Core {
             detail: Error::UriInvalidParameter {
                 name: "entry_id".to_owned(),
-                reason: "含非十六进制字符".to_owned(),
+                reason: "contains a non-hexadecimal character".to_owned(),
             }
             .into(),
         }),
@@ -1916,7 +1916,7 @@ impl FfiResponder {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::AuthMessageMalformed {
-                    reason: "会话标识长度不对",
+                    reason: "wrong session identifier length",
                 })?;
         let vault = vault.lock();
         let responder = self.lock();
@@ -1961,15 +1961,15 @@ fn kdf_params(
     Ok(KdfParams::new(
         narrow(
             memory_kib.unwrap_or(u64::from(recommended.memory_kib())),
-            "内存上限超出可表示范围",
+            "memory limit is outside the representable range",
         )?,
         narrow(
             iterations.unwrap_or(u64::from(recommended.iterations())),
-            "迭代次数超出可表示范围",
+            "iteration count is outside the representable range",
         )?,
         narrow(
             parallelism.unwrap_or(u64::from(recommended.parallelism())),
-            "并行度超出可表示范围",
+            "parallelism is outside the representable range",
         )?,
     )?)
 }
@@ -1989,23 +1989,26 @@ mod tests {
             FfiAlgorithm::Sha1,
             FfiDigits::Eight,
         )
-        .expect("应能计算");
+        .expect("should compute");
         assert_eq!(code, "94287082");
     }
 
     #[test]
     fn uri_roundtrips_through_ffi_types() {
         let original = "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME&algorithm=SHA256&digits=7&period=45";
-        let parsed = parse_otpauth_uri(original.to_owned()).expect("应能解析");
+        let parsed = parse_otpauth_uri(original.to_owned()).expect("should parse");
         assert_eq!(parsed.account, "alice");
         assert_eq!(parsed.issuer.as_deref(), Some("ACME"));
         assert_eq!(parsed.algorithm, FfiAlgorithm::Sha256);
         assert_eq!(parsed.digits, FfiDigits::Seven);
         assert_eq!(parsed.period, 45);
 
-        let back = serialize_otpauth_uri(parsed.clone()).expect("应能序列化");
-        let reparsed = parse_otpauth_uri(back).expect("应能再次解析");
-        assert_eq!(reparsed, parsed, "FFI 往返后条目应等价");
+        let back = serialize_otpauth_uri(parsed.clone()).expect("should serialize");
+        let reparsed = parse_otpauth_uri(back).expect("should parse again");
+        assert_eq!(
+            reparsed, parsed,
+            "the entry should be equivalent after an FFI round trip"
+        );
     }
 
     #[test]
@@ -2021,7 +2024,7 @@ mod tests {
                 assert_eq!(limit, MAX_SECRET_CHARS as u64);
                 assert_eq!(actual, (MAX_SECRET_CHARS + 1) as u64);
             }
-            other => panic!("应返回 InputTooLong，实际 {other:?}"),
+            other => panic!("expected InputTooLong, got {other:?}"),
         }
     }
 
@@ -2029,9 +2032,11 @@ mod tests {
     fn length_limit_counts_characters_not_bytes() {
         let chinese = "中".repeat(MAX_SECRET_CHARS);
         match secret_byte_len(chinese) {
-            Err(FfiError::InputTooLong { .. }) => panic!("按字符计不该触发上限"),
+            Err(FfiError::InputTooLong { .. }) => {
+                panic!("counting characters must not hit the limit")
+            }
             Err(FfiError::Core { .. }) => {}
-            Ok(_) => panic!("非 Base32 输入不该解析成功"),
+            Ok(_) => panic!("non-Base32 input must not parse"),
         }
     }
 
@@ -2045,7 +2050,7 @@ mod tests {
                 FfiAlgorithm::Sha1,
                 FfiDigits::Six,
             )
-            .expect("应能计算");
+            .expect("should compute");
             assert_eq!(&got, want, "counter={counter}");
         }
     }
@@ -2059,7 +2064,7 @@ mod tests {
             FfiAlgorithm::Sha1,
             FfiDigits::Eight,
         )
-        .expect("应能计算");
+        .expect("should compute");
         let hit = verify_code_with_drift(
             RFC_SECRET.to_owned(),
             1,
@@ -2068,7 +2073,7 @@ mod tests {
             FfiDigits::Eight,
             code.clone(),
         )
-        .expect("应能校验");
+        .expect("should verify");
         assert_eq!(hit, Some(0));
 
         let next = totp_code(
@@ -2078,7 +2083,7 @@ mod tests {
             FfiAlgorithm::Sha1,
             FfiDigits::Eight,
         )
-        .expect("应能计算");
+        .expect("should compute");
         let offset = verify_code_with_drift(
             RFC_SECRET.to_owned(),
             1,
@@ -2087,16 +2092,16 @@ mod tests {
             FfiDigits::Eight,
             next,
         )
-        .expect("应能校验");
+        .expect("should verify");
         assert_eq!(offset, Some(1));
     }
 
     #[test]
     fn generated_secrets_are_32_bytes_and_unique() {
-        let a = generate_secret_base32().expect("应能生成");
-        let b = generate_secret_base32().expect("应能生成");
-        assert_ne!(a, b, "两次生成不该相同");
-        assert_eq!(secret_byte_len(a).expect("应能解析"), 32);
+        let a = generate_secret_base32().expect("should generate");
+        let b = generate_secret_base32().expect("should generate");
+        assert_ne!(a, b, "two generated secrets must differ");
+        assert_eq!(secret_byte_len(a).expect("should parse"), 32);
     }
 
     #[test]
@@ -2113,7 +2118,7 @@ mod tests {
         };
         assert!(
             serialize_otpauth_uri(auth).is_err(),
-            "含冒号的账号名应被拒绝"
+            "an account name containing a colon must be rejected"
         );
     }
 
@@ -2134,7 +2139,7 @@ mod tests {
     impl TestKeys {
         /// Returns or creates the signing key for a label.
         fn key_for(&self, label: &str) -> p256::ecdsa::SigningKey {
-            let mut keys = self.keys.lock().expect("测试中无并发中毒");
+            let mut keys = self.keys.lock().expect("no lock poisoning in tests");
             keys.entry(label.to_owned())
                 .or_insert_with(|| {
                     let scalar = sha2::Digest::finalize({
@@ -2142,7 +2147,7 @@ mod tests {
                         sha2::Digest::update(&mut hasher, label.as_bytes());
                         hasher
                     });
-                    p256::ecdsa::SigningKey::from_slice(&scalar).expect("标量应当合法")
+                    p256::ecdsa::SigningKey::from_slice(&scalar).expect("the scalar must be valid")
                 })
                 .clone()
         }
@@ -2170,16 +2175,20 @@ mod tests {
 
     impl FfiSecureStore for TestStore {
         fn load_master_key(&self) -> Result<Option<Vec<u8>>, FfiError> {
-            Ok(self.master.lock().expect("测试中无并发中毒").clone())
+            Ok(self
+                .master
+                .lock()
+                .expect("no lock poisoning in tests")
+                .clone())
         }
 
         fn store_master_key(&self, key: Vec<u8>) -> Result<(), FfiError> {
-            *self.master.lock().expect("测试中无并发中毒") = Some(key);
+            *self.master.lock().expect("no lock poisoning in tests") = Some(key);
             Ok(())
         }
 
         fn delete_master_key(&self) -> Result<(), FfiError> {
-            *self.master.lock().expect("测试中无并发中毒") = None;
+            *self.master.lock().expect("no lock poisoning in tests") = None;
             Ok(())
         }
 
@@ -2226,9 +2235,12 @@ mod tests {
             store_a,
             "device-a".to_owned(),
         )
-        .expect("注册应当成功");
-        assert!(vault_a.is_empty(), "前提：这个保险库确实是空的");
-        let data = vault_a.serialize().expect("应当能序列化");
+        .expect("registration should succeed");
+        assert!(
+            vault_a.is_empty(),
+            "precondition: this vault really is empty"
+        );
+        let data = vault_a.serialize().expect("should serialize");
 
         let store_b = Arc::new(TestStore::default());
         FfiVault::register(
@@ -2236,15 +2248,15 @@ mod tests {
             store_b.clone(),
             "device-b".to_owned(),
         )
-        .expect("注册应当成功");
+        .expect("registration should succeed");
 
         let error = FfiVault::open(store_b, data)
             .err()
-            .expect("空保险库用错误密钥必须被拒");
+            .expect("an empty vault must be rejected with a wrong key");
         assert_eq!(
             error.kind(),
             "vault_decryption_failed",
-            "必须是「解不开」，而不是「没注册」——两者的界面动作完全不同"
+            "it must be \"cannot decrypt\", not \"not registered\": the two lead to completely different user interface actions"
         );
     }
 
@@ -2258,24 +2270,27 @@ mod tests {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
         let vault = FfiVault::register(keys.clone(), store.clone(), "device-a".to_owned())
-            .expect("注册应当成功");
-        assert!(vault.is_empty(), "注册不带条目");
+            .expect("registration should succeed");
+        assert!(vault.is_empty(), "registration adds no entries");
 
         let id = vault
             .add_entry(sample_entry("GitHub"), NOW)
-            .expect("应当能添加条目");
+            .expect("should add the entry");
         assert_eq!(vault.entry_count(), 1);
 
-        let code = vault.totp_for(id.clone(), NOW).expect("应当能算验证码");
-        assert_eq!(code.len(), 6, "六位验证码");
+        let code = vault
+            .totp_for(id.clone(), NOW)
+            .expect("should compute the code");
+        assert_eq!(code.len(), 6, "six-digit code");
 
-        let data = vault.serialize().expect("应当能序列化");
-        let reopened = FfiVault::open(store, data).expect("应当能用存储里的主密钥打开");
+        let data = vault.serialize().expect("should serialize");
+        let reopened =
+            FfiVault::open(store, data).expect("should open with the master key from the store");
         assert_eq!(reopened.entry_count(), 1);
         assert_eq!(
-            reopened.totp_for(id, NOW).expect("应当能算验证码"),
+            reopened.totp_for(id, NOW).expect("should compute the code"),
             code,
-            "同一条条目在重新打开后必须算出同一个验证码"
+            "the same entry must produce the same code after reopening"
         );
     }
 
@@ -2289,22 +2304,28 @@ mod tests {
     fn updating_an_entry_keeps_its_id_and_leaves_no_tombstone() {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
-        let vault = FfiVault::register(keys, store, "device-a".to_owned()).expect("注册应当成功");
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
         let id = vault
             .add_entry(sample_entry("GitHub"), NOW)
-            .expect("应当能添加条目");
+            .expect("should add the entry");
 
         let mut edited = sample_entry("GitHub (work)");
         edited.id = id.clone();
         vault
             .update_entry(edited, NOW + 60)
-            .expect("应当能修改条目");
+            .expect("should update the entry");
 
-        assert_eq!(vault.entry_count(), 1, "修改不该多出一条");
-        assert_eq!(vault.tombstone_count(), 0, "修改不是删除");
-        let entry = vault.entry(id).expect("标识必须仍然指向该条目");
+        assert_eq!(vault.entry_count(), 1, "an update must not add an entry");
+        assert_eq!(vault.tombstone_count(), 0, "an update is not a deletion");
+        let entry = vault
+            .entry(id)
+            .expect("the identifier must still point at the entry");
         assert_eq!(entry.name, "GitHub (work)");
-        assert_eq!(entry.created_at, NOW, "创建时间应当被保留");
+        assert_eq!(
+            entry.created_at, NOW,
+            "the creation time should be preserved"
+        );
     }
 
     /// A **nonexistent** identifier must be reported separately by update and by
@@ -2316,18 +2337,21 @@ mod tests {
     fn a_missing_entry_id_is_reported_as_not_found() {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
-        let vault = FfiVault::register(keys, store, "device-a".to_owned()).expect("注册应当成功");
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
 
         let mut ghost = sample_entry("ghost");
         ghost.id = "0".repeat(32);
         let error = vault
             .update_entry(ghost, NOW)
-            .expect_err("不存在的标识应当报错");
+            .expect_err("a nonexistent identifier should be reported");
         assert_eq!(error.kind(), "vault_entry_not_found");
 
         assert!(
-            !vault.remove_entry("0".repeat(32), NOW).expect("应当能调用"),
-            "删除不存在的条目应当返回 false"
+            !vault
+                .remove_entry("0".repeat(32), NOW)
+                .expect("should be callable"),
+            "removing a nonexistent entry should return false"
         );
         assert_eq!(vault.entry_count(), 0);
     }
@@ -2343,33 +2367,35 @@ mod tests {
         let old_store = Arc::new(TestStore::default());
         let old_vault =
             FfiVault::register(old_keys.clone(), old_store.clone(), "device-a".to_owned())
-                .expect("注册应当成功");
+                .expect("registration should succeed");
         old_vault
             .add_entry(sample_entry("GitHub"), NOW)
-            .expect("应当能添加条目");
-        let data = old_vault.serialize().expect("应当能序列化");
+            .expect("should add the entry");
+        let data = old_vault.serialize().expect("should serialize");
 
-        let login = FfiLogin::begin().expect("应当能开始登录");
+        let login = FfiLogin::begin().expect("should start the login");
         let joiner_keys = Arc::new(TestKeys::default());
-        let joiner =
-            FfiJoiner::from_qr(login.payload(), "device-b".to_owned()).expect("应当能建立会话");
-        let request = joiner.request(joiner_keys.clone()).expect("应当能发出请求");
+        let joiner = FfiJoiner::from_qr(login.payload(), "device-b".to_owned())
+            .expect("should establish the session");
+        let request = joiner
+            .request(joiner_keys.clone())
+            .expect("should send the request");
         let reply = login
             .authorize(old_vault.clone(), request)
-            .expect("应当能授权");
+            .expect("should authorize");
         let joiner_store = Arc::new(TestStore::default());
         let master = joiner
             .complete(reply, joiner_keys, joiner_store.clone())
-            .expect("应当能完成登录");
+            .expect("should complete the login");
 
-        assert_eq!(master.len(), 32, "主密钥是 32 字节");
+        assert_eq!(master.len(), 32, "the master key is 32 bytes");
         assert!(
-            joiner_store.master.lock().expect("无中毒").is_some(),
-            "主密钥必须已经写入新设备的平台存储"
+            joiner_store.master.lock().expect("not poisoned").is_some(),
+            "the master key must already be in the new device's platform store"
         );
 
-        let new_vault = FfiVault::open(joiner_store, data).expect("新设备应当能打开老设备的保险库");
-        assert_eq!(new_vault.entry_count(), 1, "老设备的那一条应当可见");
+        let new_vault = FfiVault::open(joiner_store, data).expect("the new device should open the old device's vault");
+        assert_eq!(new_vault.entry_count(), 1, "the old device's entry should be visible");
     }
 
     /// A login can be completed only once, and the second attempt reports the
@@ -2378,26 +2404,30 @@ mod tests {
     fn a_login_cannot_be_completed_twice_across_the_boundary() {
         let old_keys = Arc::new(TestKeys::default());
         let old_store = Arc::new(TestStore::default());
-        let old_vault =
-            FfiVault::register(old_keys, old_store, "device-a".to_owned()).expect("注册应当成功");
-        let login = FfiLogin::begin().expect("应当能开始登录");
+        let old_vault = FfiVault::register(old_keys, old_store, "device-a".to_owned())
+            .expect("registration should succeed");
+        let login = FfiLogin::begin().expect("should start the login");
         let joiner_keys = Arc::new(TestKeys::default());
-        let joiner =
-            FfiJoiner::from_qr(login.payload(), "device-b".to_owned()).expect("应当能建立会话");
-        let request = joiner.request(joiner_keys.clone()).expect("应当能发出请求");
-        let reply = login.authorize(old_vault, request).expect("应当能授权");
+        let joiner = FfiJoiner::from_qr(login.payload(), "device-b".to_owned())
+            .expect("should establish the session");
+        let request = joiner
+            .request(joiner_keys.clone())
+            .expect("should send the request");
+        let reply = login
+            .authorize(old_vault, request)
+            .expect("should authorize");
         let joiner_store = Arc::new(TestStore::default());
 
         joiner
             .complete(reply.clone(), joiner_keys.clone(), joiner_store.clone())
-            .expect("第一次应当成功");
+            .expect("the first attempt should succeed");
         let error = joiner
             .complete(reply, joiner_keys, joiner_store)
-            .expect_err("第二次必须失败");
+            .expect_err("the second attempt must fail");
         assert_eq!(
             error.kind(),
             "pairing_authentication_failed",
-            "必须与伪造应答同一个错误，不给重放者一个区分信号"
+            "it must be the same error as a forged reply, so a replayer gets no distinguishing signal"
         );
     }
 
@@ -2406,23 +2436,24 @@ mod tests {
     fn a_recovery_file_restores_the_same_master_key() {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
-        let vault = FfiVault::register(keys, store, "device-a".to_owned()).expect("注册应当成功");
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
         vault
             .add_entry(sample_entry("GitHub"), NOW)
-            .expect("应当能添加条目");
-        let data = vault.serialize().expect("应当能序列化");
+            .expect("should add the entry");
+        let data = vault.serialize().expect("should serialize");
 
         let file = vault
             .export_recovery_key("correct horse".to_owned(), Some(8), Some(1), Some(1))
-            .expect("应当能导出");
+            .expect("should export");
 
         let new_store = Arc::new(TestStore::default());
         let restored =
             import_recovery_key(file.clone(), "correct horse".to_owned(), new_store.clone())
-                .expect("应当能导入");
+                .expect("should import");
         assert_eq!(restored.len(), 32);
 
-        let reopened = FfiVault::open(new_store, data).expect("应当能打开");
+        let reopened = FfiVault::open(new_store, data).expect("should open");
         assert_eq!(reopened.entry_count(), 1);
 
         let wrong = import_recovery_key(
@@ -2430,7 +2461,7 @@ mod tests {
             "wrong passphrase".to_owned(),
             Arc::new(TestStore::default()),
         )
-        .expect_err("口令错误应当失败");
+        .expect_err("a wrong passphrase should fail");
         assert_eq!(wrong.kind(), "recovery_authentication_failed");
     }
 
@@ -2440,29 +2471,29 @@ mod tests {
     fn challenge_response_confirms_both_sides_across_the_boundary() {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
-        let vault =
-            FfiVault::register(keys.clone(), store, "device-a".to_owned()).expect("注册应当成功");
+        let vault = FfiVault::register(keys.clone(), store, "device-a".to_owned())
+            .expect("registration should succeed");
 
-        let verifier = FfiVerifier::begin().expect("应当能发起挑战");
-        let responder = FfiResponder::accept(verifier.challenge()).expect("应当能接受挑战");
+        let verifier = FfiVerifier::begin().expect("should start the challenge");
+        let responder = FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
         let response = responder
             .respond(vault.clone(), "device-a".to_owned(), keys)
-            .expect("应当能生成应答");
+            .expect("should produce the response");
 
         assert!(
             verifier
                 .verify(response, vault.clone())
-                .expect("应当能校验应答"),
-            "第二步应当通过"
+                .expect("should verify the response"),
+            "the second step should pass"
         );
 
-        let session_id = verifier.session_id().expect("校验之后应当有会话标识");
-        let confirmation = verifier.confirmation().expect("校验之后应当有确认标签");
+        let session_id = verifier.session_id().expect("a session identifier should exist after verification");
+        let confirmation = verifier.confirmation().expect("a confirmation tag should exist after verification");
         assert!(
             responder
                 .confirm(vault, session_id, confirmation)
-                .expect("应当能确认"),
-            "第三步应当通过"
+                .expect("should confirm"),
+            "the third step should pass"
         );
     }
 
@@ -2471,20 +2502,20 @@ mod tests {
     fn a_challenge_cannot_be_verified_twice() {
         let keys = Arc::new(TestKeys::default());
         let store = Arc::new(TestStore::default());
-        let vault =
-            FfiVault::register(keys.clone(), store, "device-a".to_owned()).expect("注册应当成功");
-        let verifier = FfiVerifier::begin().expect("应当能发起挑战");
-        let responder = FfiResponder::accept(verifier.challenge()).expect("应当能接受挑战");
+        let vault = FfiVault::register(keys.clone(), store, "device-a".to_owned())
+            .expect("registration should succeed");
+        let verifier = FfiVerifier::begin().expect("should start the challenge");
+        let responder = FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
         let response = responder
             .respond(vault.clone(), "device-a".to_owned(), keys)
-            .expect("应当能生成应答");
+            .expect("should produce the response");
 
         verifier
             .verify(response.clone(), vault.clone())
-            .expect("第一次应当通过");
+            .expect("the first attempt should pass");
         let error = verifier
             .verify(response, vault)
-            .expect_err("第二次必须失败");
+            .expect_err("the second attempt must fail");
         assert_eq!(error.kind(), "auth_proof_failed");
     }
 
@@ -2516,13 +2547,13 @@ mod tests {
             core_error_kind(&Error::TimestampZero),
         ];
         for kind in kinds {
-            assert_ne!(kind, "unknown", "有变体没有被映射到稳定的 kind");
+            assert_ne!(kind, "unknown", "a variant is not mapped to a stable kind");
         }
         let unique: std::collections::HashSet<_> = kinds.iter().collect();
         assert_eq!(
             unique.len(),
             kinds.len(),
-            "两个变体映到了同一个 kind，端侧就无法区分它们"
+            "two variants map to the same kind, so the client side cannot tell them apart"
         );
     }
 }
