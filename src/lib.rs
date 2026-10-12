@@ -357,12 +357,12 @@ pub enum FfiError {
     /// different set of failure modes: a payload that will not fit, an image with no code
     /// in it, an image whose buffer does not match its dimensions. The message never
     /// carries a payload.
-    #[error("{message}")]
+    #[error("{detail}")]
     Qr {
         /// Stable kind for the host to branch on, in `snake_case`.
         kind: String,
-        /// Human-readable message. Never contains a payload or a secret.
-        message: String,
+        /// Human-readable detail. Never contains a payload or a secret.
+        detail: String,
     },
 }
 
@@ -839,7 +839,7 @@ pub fn qr_decode(pixels: Vec<u8>, width: u32, height: u32) -> Result<String, Ffi
     let payload = qualia_transport::qr::scan::decode_payload(&image).map_err(qr_error)?;
     String::from_utf8(payload).map_err(|_| FfiError::Qr {
         kind: "payload_not_utf8".to_owned(),
-        message: "the code carried bytes that are not UTF-8 text".to_owned(),
+        detail: "the code carried bytes that are not UTF-8 text".to_owned(),
     })
 }
 
@@ -870,7 +870,7 @@ fn qr_error(source: qualia_transport::Error) -> FfiError {
 
     FfiError::Qr {
         kind: kind.to_owned(),
-        message: source.to_string(),
+        detail: source.to_string(),
     }
 }
 
