@@ -30,35 +30,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This repository depends on the core library via `path = "Core"`, so CI checks
-      # the core out into `Core/` **inside this repository**.
-      #
-      # This matches the local layout, where the application provides the same directory.
-      #
-      # `actions/checkout` refuses paths outside the workspace, so `../Core` is not possible here.
-      #
-      # The checkout lands at `<repository root>/Core`, the path the
-      # `qualia2fa-core` dependency declares, and it follows the core default branch.
-      #
-      # The device identity library (`qualia-dik`) is a crates.io version dependency, so
-      # it needs no checkout.
+      # Both dependencies (`qualia2fa-core`, `qualia-dik`) are crates.io version
+      # dependencies, so this repository checks nothing out.
       #
       # `Cargo.lock` is committed and every cargo invocation passes `--locked`, so a
       # stale lockfile fails the build instead of being silently updated. Tests live in
       # `src/lib.rs`: the crate types in Cargo.toml produce no rlib, so nothing under
       # `tests/` can link this crate.
-      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
-        uses: actions/checkout@v4
-        with:
-          repository: Qualia2FA/Qualia2FA-Core
-          path: Core
-
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       # `-D warnings` turns `unsafe_code = "warn"` into a hard error, so new unsafe code
       # cannot slip in without being discussed explicitly in review.
-      - name: cargo clippy（警告视为错误）
+      - name: cargo clippy (warnings as errors)
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
@@ -66,7 +50,7 @@ jobs:
 
       # `RUSTDOCFLAGS=-D warnings` is what makes this step a check: a plain `cargo doc`
       # reports broken intra-doc links as warnings only.
-      - name: cargo doc（警告视为错误）
+      - name: cargo doc (warnings as errors)
         run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
@@ -75,25 +59,19 @@ jobs:
   # The application side depends on this job: a broken binding generator surfaces in
   # the application repository, where it is far more expensive to diagnose.
   bindgen:
-    name: 绑定生成（Kotlin / Swift）
+    name: Generate the bindings (Kotlin / Swift)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
-        uses: actions/checkout@v4
-        with:
-          repository: Qualia2FA/Qualia2FA-Core
-          path: Core
 
       # `--all-targets` is required: `--bin uniffi-bindgen` builds only that binary and
       # produces no cdylib, while the binding generator reads
       # `target/debug/qualia2fa_ffi.dll`. Both the Kotlin and the Swift bindings are
       # generated from that same library.
-      - name: 构建库与绑定生成器
+      - name: Build the library and the binding generator
         run: cargo build --locked --all-targets
 
-      - name: 生成 Kotlin 绑定
+      - name: Generate the Kotlin bindings
         shell: pwsh
         run: |
           # uniffi-bindgen calls `cargo metadata` internally, so it must run at the repository root
@@ -107,22 +85,22 @@ jobs:
           $ktFile = Get-ChildItem -Path "$env:RUNNER_TEMP/bindings-kotlin" `
                     -Recurse -Filter 'qualia2fa_ffi.kt' | Select-Object -First 1
           if (-not $ktFile) {
-            throw "未生成 Kotlin 绑定文件"
+            throw "Kotlin binding file was not generated"
           }
-          Write-Host "生成: $($ktFile.FullName) ($($ktFile.Length) B)"
+          Write-Host "Generated: $($ktFile.FullName) ($($ktFile.Length) B)"
 
           # The binding package name is what the application imports, so changing it breaks the build
           $kt = Get-Content -Path $ktFile.FullName -Raw
           if ($kt -notmatch 'package uniffi\.qualia2fa_ffi') {
-            throw "生成的 Kotlin 绑定 package 名不是 uniffi.qualia2fa_ffi"
+            throw "Generated Kotlin bindings do not declare package uniffi.qualia2fa_ffi"
           }
 
           # The application loads the dynamic library through JNA, so this keeps the JVM route viable
           if ($kt -notmatch 'import com\.sun\.jna\.') {
-            throw "生成的 Kotlin 绑定未使用 JNA，JVM 路线的前提已不成立"
+            throw "Generated Kotlin bindings do not use JNA, so the JVM route is not viable"
           }
 
-      - name: 生成 Swift 绑定
+      - name: Generate the Swift bindings
         shell: pwsh
         run: |
           cargo run --bin uniffi-bindgen -- generate `
@@ -130,12 +108,12 @@ jobs:
             --language swift --out-dir "$env:RUNNER_TEMP/bindings-swift"
           $sw = Get-ChildItem "$env:RUNNER_TEMP/bindings-swift" -Recurse -File -ErrorAction SilentlyContinue
           if (-not $sw) {
-            throw "未生成 Swift 绑定产物"
+            throw "Swift binding artifacts were not generated"
           }
           # The Swift side is three artifacts, and an Xcode project needs all of them
           foreach ($ext in @('.swift', '.h', '.modulemap')) {
             if (-not ($sw | Where-Object { $_.Name -like "*$ext" })) {
-              throw "Swift 绑定缺少 $ext 产物"
+              throw "Swift bindings are missing the $ext artifact"
             }
           }
-          $sw | ForEach-Object { Write-Host "生成: $($_.Name) ($($_.Length) B)" }
+          $sw | ForEach-Object { Write-Host "Generated: $($_.Name) ($($_.Length) B)" }
