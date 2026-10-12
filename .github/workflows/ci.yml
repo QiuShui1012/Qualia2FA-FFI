@@ -1,12 +1,12 @@
 name: CI
 
-# 说明：本仓库根目录是 `FFI/`（crate `qualia2fa-ffi`），所有 job 都在仓库根执行。
+# This repository root is `FFI/` (crate `qualia2fa-ffi`).
 #
-# 本仓库的关键职责是「边界」而非密码学逻辑，因此 CI 的重点与 Core 不同：
-#   1. 确认 FFI 层没有把核心逻辑搬进来（靠人工审查，CI 只能保证它能编译并通过测试）
-#   2. 确认绑定生成仍然可用——绑定生成失败会让端侧无法构建，
-#      而那要到端侧编译时才会暴露，代价很高
-#   3. 确认 unsafe 面没有无声扩大（`unsafe_code = "warn"`，CI 用 -D warnings 上升为错误）
+# Every job runs on `windows-latest` at the repository root and passes `--locked`.
+# This crate owns the boundary rather than cryptography, so CI focuses on:
+#   1. the FFI layer holding no core logic (a review matter: CI only proves it compiles)
+#   2. binding generation still working, since the application cannot build without it
+#   3. the unsafe surface not growing silently (`unsafe_code = "warn"`, raised to an error by `-D warnings`)
 
 on:
   push:
@@ -23,30 +23,30 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── 第一关：格式、lint、测试 ────────────────────────────────────────────
+  # ── Stage 1: format, lint, test ────────────────────────────────────────────
   check:
     name: fmt + clippy + test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 本仓库以 `path = "Core"` 依赖核心库，因此 CI 必须把核心检出到**本仓库内**
-      # 的 `Core/`。
+      # This repository depends on the core library via `path = "Core"`, so CI checks
+      # the core out into `Core/` **inside this repository**.
       #
-      # # 为什么是嵌套而不是同级
+      # This matches the local layout, where the application provides the same directory.
       #
-      # `actions/checkout` **拒绝**检出到工作区之外的路径：
+      # `actions/checkout` refuses paths outside the workspace, so `../Core` is not possible here.
       #
-      #     ##[error]Repository path 'D:\a\Qualia2FA-FFI\Core'
-      #               is not under 'D:\a\Qualia2FA-FFI\Qualia2FA-FFI'
+      # The checkout lands at `<repository root>/Core`, the path the
+      # `qualia2fa-core` dependency declares, and it follows the core default branch.
       #
-      # 因此 FFI 这里的上级只能走嵌套。这与本地一致：端侧把本仓库当 submodule
-      # 引入时，同一位置由 `Main/FFI/Core` 提供。
+      # The device identity library (`qualia-dik`) is a crates.io version dependency, so
+      # it needs no checkout.
       #
-      # 设备身份库（`qualia-dik`）曾经也是嵌套的，两条嵌套会让同一个物理目录被两个
-      # 相对路径引用、Cargo 报 `package collision in the lockfile`。它发布到
-      # crates.io 之后改成版本号依赖，碰撞随之消失——**这是「独立子库要发布」这条
-      # 规则最实在的收益**。
+      # `Cargo.lock` is committed and every cargo invocation passes `--locked`, so a
+      # stale lockfile fails the build instead of being silently updated. Tests live in
+      # `src/lib.rs`: the crate types in Cargo.toml produce no rlib, so nothing under
+      # `tests/` can link this crate.
       - name: 取出 qualia2fa-core（满足 path = "Core" 依赖）
         uses: actions/checkout@v4
         with:
@@ -56,22 +56,24 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      # `-D warnings` 会把 `unsafe_code = "warn"` 变成硬错误：
-      # 任何新增的 unsafe 都必须在代码审查中被显式讨论，不能悄悄混进来。
+      # `-D warnings` turns `unsafe_code = "warn"` into a hard error, so new unsafe code
+      # cannot slip in without being discussed explicitly in review.
       - name: cargo clippy（警告视为错误）
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
         run: cargo test --locked
 
+      # `RUSTDOCFLAGS=-D warnings` is what makes this step a check: a plain `cargo doc`
+      # reports broken intra-doc links as warnings only.
       - name: cargo doc（警告视为错误）
         run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # ── 第二关：绑定生成必须仍然可用 ────────────────────────────────────────
-  # 这一关是端侧构建的前置条件。若绑定生成坏了，端侧会在自己仓库里报错，
-  # 定位成本远高于在这里挡住。
+  # ── Stage 2: binding generation must keep working ────────────────────────────────────────
+  # The application side depends on this job: a broken binding generator surfaces in
+  # the application repository, where it is far more expensive to diagnose.
   bindgen:
     name: 绑定生成（Kotlin / Swift）
     runs-on: windows-latest
@@ -84,24 +86,24 @@ jobs:
           repository: Qualia2FA/Qualia2FA-Core
           path: Core
 
-      # 必须用 `--all-targets`，不能写成 `--bin uniffi-bindgen`：
-      # 后者**只构建那个二进制**，不会产出 cdylib。而绑定生成器要读的正是
-      # `target/debug/qualia2fa_ffi.dll`，于是它会报：
-      #     failed to open file `target/debug/qualia2fa_ffi.dll`
+      # `--all-targets` is required: `--bin uniffi-bindgen` builds only that binary and
+      # produces no cdylib, while the binding generator reads
+      # `target/debug/qualia2fa_ffi.dll`. Both the Kotlin and the Swift bindings are
+      # generated from that same library.
       - name: 构建库与绑定生成器
         run: cargo build --locked --all-targets
 
       - name: 生成 Kotlin 绑定
         shell: pwsh
         run: |
-          # uniffi-bindgen 内部会调用 `cargo metadata`，必须在仓库根执行
+          # uniffi-bindgen calls `cargo metadata` internally, so it must run at the repository root
           cargo run --bin uniffi-bindgen -- generate `
             --library target/debug/qualia2fa_ffi.dll `
             --language kotlin --out-dir "$env:RUNNER_TEMP/bindings-kotlin"
 
-          # 产物**不**直接在 out-dir 下，而是按 package 名分层：
+          # The output is not placed directly under out-dir but nested by package name:
           #   <out-dir>/uniffi/qualia2fa_ffi/qualia2fa_ffi.kt
-          # 因此必须递归查找，不能假设它在顶层。
+          # so it must be searched for recursively.
           $ktFile = Get-ChildItem -Path "$env:RUNNER_TEMP/bindings-kotlin" `
                     -Recurse -Filter 'qualia2fa_ffi.kt' | Select-Object -First 1
           if (-not $ktFile) {
@@ -109,13 +111,13 @@ jobs:
           }
           Write-Host "生成: $($ktFile.FullName) ($($ktFile.Length) B)"
 
-          # 关键：绑定的 package 名是端侧 import 的依据，改了会直接破坏端侧编译
+          # The binding package name is what the application imports, so changing it breaks the build
           $kt = Get-Content -Path $ktFile.FullName -Raw
           if ($kt -notmatch 'package uniffi\.qualia2fa_ffi') {
             throw "生成的 Kotlin 绑定 package 名不是 uniffi.qualia2fa_ffi"
           }
 
-          # 端侧靠 JNA 加载动态库，这条保证 JVM 路线的前提仍然成立
+          # The application loads the dynamic library through JNA, so this keeps the JVM route viable
           if ($kt -notmatch 'import com\.sun\.jna\.') {
             throw "生成的 Kotlin 绑定未使用 JNA，JVM 路线的前提已不成立"
           }
@@ -130,7 +132,7 @@ jobs:
           if (-not $sw) {
             throw "未生成 Swift 绑定产物"
           }
-          # Swift 侧由三件套组成，缺任何一件都无法被 Xcode 工程引用
+          # The Swift side is three artifacts, and an Xcode project needs all of them
           foreach ($ext in @('.swift', '.h', '.modulemap')) {
             if (-not ($sw | Where-Object { $_.Name -like "*$ext" })) {
               throw "Swift 绑定缺少 $ext 产物"

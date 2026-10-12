@@ -8,88 +8,94 @@ repository = "https://github.com/Qualia2FA/Qualia2FA-FFI"
 readme = "README.md"
 publish = false
 
-# ⚠️ 本 crate **不能** 加 `#![forbid(unsafe_code)]`。
+# This crate must **not** enable `#![forbid(unsafe_code)]`.
 #
-# `uniffi::setup_scaffolding!()` 在当前 crate 内展开 FFI 边界所需的 unsafe 代码
-# （裸指针解引用、`catch_unwind`、字符串所有权转移）。这是不可协商的：FFI 边界
-# 本身就是 unsafe 的，安全性由 UniFFI 的生成代码与我们的 `Result` 返回约定来保证。
+# `uniffi::setup_scaffolding!()` expands the unsafe code required at the FFI
+# boundary: raw pointer dereference, `catch_unwind`, string ownership transfer.
+# The boundary is inherently unsafe.
 #
-# 安全边界因此划在 crate 之间而非模块之间：
-#   - qualia2fa-core：无 I/O、无 unsafe（`forbid(unsafe_code)`）、可独立审计
-#   - qualia2fa-ffi ：唯一允许 unsafe 的地方，且只应包含「搬运」逻辑
-# 审查本仓库时，注意力应集中在「有没有把核心的逻辑搬到这里来」——
-# 任何加密或解析逻辑出现在本 crate 里都是设计倒退。
+# Soundness rests on the generated UniFFI code and on the `Result` return
+# convention, so the safety boundary is drawn between crates, not modules:
+#   - qualia2fa-core: no I/O, no unsafe (`forbid(unsafe_code)`), auditable alone
+#   - qualia2fa-ffi : the only place unsafe is allowed, marshalling logic only
+# No cryptography or parsing logic belongs in this crate.
+#
+# `unsafe_code = "warn"` keeps new unsafe code visible; CI raises it to an error
+# with `-D warnings`.
 [lints.rust]
 unsafe_code = "warn"
 
 [lib]
-# cdylib 供 JVM（JNA）/Android/iOS 动态加载；staticlib 供 iOS 静态链接与
-# 需要把整个库塞进单一产物的场景。两者都产出，由各平台按需取用。
+# cdylib is loaded dynamically by the JVM (JNA), Android and iOS; staticlib
+# serves iOS static linking and single-artifact builds. Both are produced.
+#
+# No rlib is produced, so integration tests under `tests/` cannot link this crate:
+# all tests are `#[cfg(test)] mod tests` inside `src/lib.rs`.
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-# 核心库的路径**必须**写成 `Core`（不带 `../`）。
+# Path dependency on the core library.
 #
-# `../Core` 的解析基准不是本清单所在目录，而是**外层仓库之上**：
-# 本地 `Qualia2FA/FFI/Cargo.toml` 里写 `../Core` 恰好命中 `Qualia2FA/Core`
-# 所以看不出问题，但在 CI 上仓库被检出到 `D:\a\Qualia2FA-FFI\Qualia2FA-FFI\`，
-# 于是 `../Core` 指向 `D:\a\Qualia2FA-FFI\Core`——该目录不存在，构建失败：
-#   failed to read `D:\a\Qualia2FA-FFI\Core\Cargo.toml`
+# The upstream repository is checked out into `Core/` inside this repository
+# (see .github/workflows/ci.yml), which is also where the application's
+# submodule layout provides it, so the path is identical locally and on CI.
+# A `../` prefix cannot be used here: `actions/checkout` refuses paths
+# outside the workspace.
 #
-# 不带前缀的 `Core` 则稳定地解析到「仓库内的 Core/」，在本地与 CI 上一致：
-#   - 本地：`Qualia2FA/Main/Core`（本仓库作为 submodule 被引入后）
-#   - CI  ：`<仓库根>/Core`（由 .github/workflows/ci.yml 显式检出）
+# The device identity library below is a crates.io version dependency and
+# needs no checkout, so the core library is the only upstream repository
+# this job checks out.
 qualia2fa-core = { path = "Core" }
 
-# 设备身份：`DevicePublicKey` / `DeviceSignature` 的类型与解析都在这里。
+# Device identity: the `DevicePublicKey` / `DeviceSignature` types live here.
 #
-# # 为什么本 crate 直接依赖它，而 Core 也依赖它
+# The host callbacks (`FfiDeviceKeys::get_or_create` / `sign`) return raw bytes.
 #
-# FFI 层要把端侧回调（`FfiDeviceKeys::get_or_create` / `sign`）返回的**裸字节**转成
-# 类型化的值，而那两个类型定义在设备身份库（`qualia-dik`）里，不在 Core 里。Core 只是
-# **再导出**它们以便下游少写一个依赖；在 FFI 这层，回调的签名直接用原类型更清楚——
-# 再导出是给「只依赖 Core 的调用方」用的便利，不是要求。
+# The FFI layer converts those bytes into the types above. Core re-exports them
+# so that callers depending on Core alone need one dependency less; this crate
+# uses the original types directly, since the callback signatures are clearer
+# with them.
 #
-# 用**版本号**，与 Core 一致。它已经发布到 crates.io（`qualia-dik 0.1.0`）。
+# A version requirement, matching the version Core uses.
 #
-# 版本号是唯一能让本地、CI 与第三方消费者看到同一份源码的写法：路径依赖会让同一个
-# 物理目录被不同的相对路径引用而变成两个包，而把上游检出到工作区**之外**在
-# GitHub Actions 上会被 `actions/checkout` 拒绝。
+# The crate is published on crates.io as `qualia-dik 0.1.0`, which puts local,
+# CI and third-party consumers on the same source. Both this crate and Core
+# depend on it directly.
 qualia-dik = "0.1"
 
-# 用于 `FfiError` 的 `Display` 与 `std::error::Error` 实现。
-# 与核心同一个 major（2.0.21），不会引入重复版本。
+# Provides the `Display` and `std::error::Error` implementations of `FfiError`.
+# Same major as the version Core uses (2.0.21), so no duplicate version.
 thiserror = "2"
 
-# UniFFI 版本策略（见 TODO.md §4.4）：
+# UniFFI version policy:
 #
-# 上游最新是 0.32.2，但我们**刻意停在 0.29.x**——端的绑定生成器 Gobley
-# 强制 `uniffi = "0.29.4"`，Rust 侧与 Kotlin 侧的脚手架必须同版本，否则
-# 生成的序列化格式不匹配。
+# Pinned to the 0.29 line: the application-side binding generator Gobley requires
+# `uniffi = "0.29.4"`, and the Rust and Kotlin scaffolding must be the same
+# version or the generated serialization format differs. Upstream is at 0.32.2.
 #
-# 取 `0.29`（等价 `^0.29`，即 >=0.29.0 <0.30.0）而非写死 `=0.29.4`：
-# 0.29.5 已发布（2025-11-14，含修复），同 minor 内 semver 兼容。
-# 这样既能吃到 0.29 线的补丁，又不会跨到 0.30。
+# `0.29` is a caret requirement (>=0.29.0, <0.30.0), not a pinned `=0.29.4`:
+# patch releases such as 0.29.5 within the same minor version are picked up
+# automatically.
 #
-# `cli` 特性提供 `uniffi::uniffi_bindgen_main`，供 `src/bin/uniffi-bindgen.rs`
-# 使用。它**必须在 `[dependencies]` 而非 `[dev-dependencies]`**：
-# dev-dependencies 的特性只对 test/example/bench 目标生效，对 `src/bin/` 下的
-# 二进制**不生效**——放在 dev 段会导致 `cargo build --bin uniffi-bindgen` 时
-# uniffi 以 `features=cargo-metadata,default` 编译，`uniffi_bindgen_main`
-# 找不到（实测报 E0425）。
+# The `cli` feature provides `uniffi::uniffi_bindgen_main`, used by
+# `src/bin/uniffi-bindgen.rs`. It must sit in `[dependencies]`, not in
+# `[dev-dependencies]`: dev-dependency features apply to test, example and
+# bench targets only, never to targets under `src/bin/`, so in the dev
+# section the entry point is missing and `cargo build --bin uniffi-bindgen`
+# finds no `uniffi_bindgen_main`.
 #
-# 代价是 clap/camino 进入本 crate 的依赖树，但它们**只被那个生成绑定的二进制
-# 使用**，不会被链接进 cdylib/staticlib，因此不影响端侧产物的体积。
+# clap and camino therefore enter this crate's dependency tree for that binary
+# only, and are not linked into cdylib/staticlib.
 uniffi = { version = "0.29", features = ["cli"] }
 
 [dev-dependencies]
-# 测试需要一个**真实的** ECDSA P-256 实现来扮演端侧设备身份，以及一个 SHA-256 来
-# 从标签确定性地导出测试私钥。
+# The tests need a real ECDSA P-256 implementation to play the host device
+# identity, and a SHA-256 to derive test private keys deterministically.
 #
-# 版本与核心库固定的一致：`p256 0.14`（0.13 依赖 `sha2 ^0.10`，会拖进第二份
-# SHA-2，而核心已经固定 0.14）。保持同一版本意味着测试跑在与生产同一条代码路径上，
-# 且锁文件里不会出现两份 `p256`/`sha2`。
+# `p256 0.14` matches the version Core pins; 0.13 depends on `sha2 ^0.10` and
+# would pull in a second SHA-2. Staying on the same version keeps the tests on
+# the production code path and the lockfile down to one `p256`/`sha2`.
 #
-# 这两项**只进测试目标**，不会链接进 cdylib/staticlib。
+# Both are test-target only and are not linked into cdylib/staticlib.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.11"
