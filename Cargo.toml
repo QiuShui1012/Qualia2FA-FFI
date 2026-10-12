@@ -2,11 +2,15 @@
 name = "qualia2fa-ffi"
 version = "0.1.0"
 edition = "2024"
-description = "Qualia2FA 的 FFI 层：把 qualia2fa-core 暴露为 UniFFI 绑定，供 Kotlin/Swift 等调用"
+description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
+rust-version = "1.89"
 repository = "https://github.com/Qualia2FA/Qualia2FA-FFI"
 readme = "README.md"
-publish = false
+# CI configuration and the dependency audit manifest are not part of the published
+# package: they are meaningless to users, and the size and contents of a crates.io
+# package are publicly visible.
+exclude = ["/.github", "/deny.toml"]
 
 # This crate must **not** enable `#![forbid(unsafe_code)]`.
 #
@@ -34,18 +38,11 @@ unsafe_code = "warn"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-# Path dependency on the core library.
-#
-# The upstream repository is checked out into `Core/` inside this repository
-# (see .github/workflows/ci.yml), which is also where the application's
-# submodule layout provides it, so the path is identical locally and on CI.
-# A `../` prefix cannot be used here: `actions/checkout` refuses paths
-# outside the workspace.
-#
-# The device identity library below is a crates.io version dependency and
-# needs no checkout, so the core library is the only upstream repository
-# this job checks out.
-qualia2fa-core = { path = "Core" }
+# A version dependency on the core library, which is published on crates.io as
+# `qualia2fa-core 0.1.0`. Local builds, CI and third-party consumers therefore
+# resolve the same source, and this repository checks nothing out: the nested
+# `Core/` submodule was removed together with the path dependency.
+qualia2fa-core = "0.1.0"
 
 # Device identity: the `DevicePublicKey` / `DeviceSignature` types live here.
 #
