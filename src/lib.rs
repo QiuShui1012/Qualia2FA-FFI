@@ -285,6 +285,7 @@ impl FfiError {
         match self {
             FfiError::InputTooLong { .. } => "input_too_long",
             FfiError::Core { detail } => &detail.kind,
+            FfiError::Qr { kind, .. } => kind,
         }
     }
 }
@@ -348,6 +349,20 @@ pub enum FfiError {
     Core {
         /// Structured summary of the core error.
         detail: FfiCoreError,
+    },
+
+    /// An error from the transport layer behind the code channel.
+    ///
+    /// Kept separate from [`FfiError::Core`] because it is a different layer with a
+    /// different set of failure modes: a payload that will not fit, an image with no code
+    /// in it, an image whose buffer does not match its dimensions. The message never
+    /// carries a payload.
+    #[error("{message}")]
+    Qr {
+        /// Stable kind for the host to branch on, in `snake_case`.
+        kind: String,
+        /// Human-readable message. Never contains a payload or a secret.
+        message: String,
     },
 }
 
@@ -718,6 +733,136 @@ pub fn core_version() -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// The code channel: turning text into a QR code and back
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A rendered QR code, as pixels the host can draw.
+///
+/// The pixels are **grayscale**, one byte per pixel, `0` for black and `255` for white.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiQrImage {
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Grayscale pixels, row major, `width * height` bytes.
+    pub pixels: Vec<u8>,
+}
+
+/// The error correction level of a code, named by what it survives.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiEcLevel {
+    /// About 7% of the code may be damaged.
+    Low,
+    /// About 15%.
+    Medium,
+    /// About 25%.
+    Quartile,
+    /// About 30%.
+    High,
+}
+
+impl From<FfiEcLevel> for qualia_transport::qr::EcLevel {
+    fn from(value: FfiEcLevel) -> Self {
+        match value {
+            FfiEcLevel::Low => Self::Low,
+            FfiEcLevel::Medium => Self::Medium,
+            FfiEcLevel::Quartile => Self::Quartile,
+            FfiEcLevel::High => Self::High,
+        }
+    }
+}
+
+/// Encodes `text` into a single QR code and renders it as grayscale pixels.
+///
+/// `scale` is how many pixels one module becomes, `quiet_zone` how many modules of
+/// margin surround the code. Text that does not fit in `max_version` is an error: the
+/// code is never truncated, and the error correction level is not silently lowered.
+///
+/// # Errors
+///
+/// Returns [`FfiError::Qr`] with kind `payload_too_large` when the text does not fit, and
+/// `bad_render_geometry` when `scale` or `quiet_zone` is zero.
+#[uniffi::export]
+pub fn qr_encode(
+    text: String,
+    ec_level: FfiEcLevel,
+    max_version: u8,
+    scale: u16,
+    quiet_zone: u16,
+) -> Result<FfiQrImage, FfiError> {
+    let profile =
+        qualia_transport::qr::QrProfile::new(ec_level.into(), max_version).map_err(qr_error)?;
+    let symbol = profile.encode_payload(text.as_bytes()).map_err(qr_error)?;
+    let image = symbol.render(scale, quiet_zone).map_err(qr_error)?;
+    Ok(FfiQrImage {
+        width: image.width(),
+        height: image.height(),
+        pixels: image.pixels().to_vec(),
+    })
+}
+
+/// Reads the text back out of a grayscale image.
+///
+/// The text is carried inside the transport's own envelope (`Q2FA1:<index>/<count>:<BASE32>`),
+/// which is what a code drawn by [`qr_encode`] contains and what any scanner sees; this
+/// function unwraps it so the caller gets back the text it encoded.
+///
+/// The input is **pixels, not an image file**: decoding the file format belongs to the
+/// platform (`ImageIO` on the JVM, `BitmapFactory` on Android, `UIImage` on iOS), because
+/// format decoders are where the historical vulnerabilities live. The host converts an
+/// imported image to grayscale and hands the result here.
+///
+/// # Errors
+///
+/// Returns [`FfiError::Qr`] with kind `bad_image_geometry` when the buffer does not match
+/// the dimensions, `not_our_qr_text` when the code is not this application's, `no_qr_found`
+/// when there is no code in the image, and `qr_decoder_panicked` when the decoder hit the
+/// assertion that degenerate images trigger. That last one is contained rather than fixed:
+/// the panic is caught here, and the fix belongs upstream.
+#[uniffi::export]
+pub fn qr_decode(pixels: Vec<u8>, width: u32, height: u32) -> Result<String, FfiError> {
+    let image =
+        qualia_transport::image::GrayImage::from_luma8(width, height, pixels).map_err(qr_error)?;
+    let payload = qualia_transport::qr::scan::decode_payload(&image).map_err(qr_error)?;
+    String::from_utf8(payload).map_err(|_| FfiError::Qr {
+        kind: "payload_not_utf8".to_owned(),
+        message: "the code carried bytes that are not UTF-8 text".to_owned(),
+    })
+}
+
+/// Reduces a transport error to a kind and a message, without the payload.
+///
+/// The transport error is `#[non_exhaustive]`, so the wildcard arm is required by the
+/// compiler rather than optional; a new variant therefore lands in `qr_error` until it is
+/// mapped, which is what the host sees as an unnamed failure. Its own test pins the kinds
+/// that matter.
+fn qr_error(source: qualia_transport::Error) -> FfiError {
+    use qualia_transport::Error as QrError;
+
+    let kind = match &source {
+        QrError::PayloadTooLarge { .. } => "payload_too_large",
+        QrError::TooManyFrames { .. } => "too_many_frames",
+        QrError::NotOurQrText => "not_our_qr_text",
+        QrError::MalformedFrameHeader => "malformed_frame_header",
+        QrError::MultiFrameUnsupported { .. } => "multi_frame_unsupported",
+        QrError::UnknownEcLevel { .. } => "unknown_ec_level",
+        QrError::VersionOutOfRange { .. } => "version_out_of_range",
+        QrError::BadRenderGeometry { .. } => "bad_render_geometry",
+        QrError::BadImageGeometry { .. } => "bad_image_geometry",
+        QrError::NoQrFound => "no_qr_found",
+        QrError::QrDecoderPanicked => "qr_decoder_panicked",
+        QrError::QrNotText => "qr_not_text",
+        _ => "qr_error",
+    };
+
+    FfiError::Qr {
+        kind: kind.to_owned(),
+        message: source.to_string(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Device identity, registration and login
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -873,7 +1018,10 @@ impl qualia2fa_core::flow::SecureStore for ForeignSecureStore {
 fn ffi_to_core_error(source: FfiError) -> Error {
     match source {
         FfiError::Core { detail } => kind_to_core_error(&detail.kind),
-        FfiError::InputTooLong { .. } => Error::DeviceKeyMissing,
+        // Neither of the boundary's own errors can arrive from a host callback: the code
+        // channel is called from the host, not into it. They degrade the same way as any
+        // other error that has no core equivalent.
+        FfiError::InputTooLong { .. } | FfiError::Qr { .. } => Error::DeviceKeyMissing,
     }
 }
 
@@ -2202,6 +2350,57 @@ fn kdf_params(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_qr_code_survives_encoding_and_decoding() {
+        for text in [
+            "hello",
+            "otpauth://totp/Example:alice?secret=MZXW6YTBOI",
+            "中文内容，含标点。",
+        ] {
+            let image = qr_encode(text.to_owned(), FfiEcLevel::Medium, 20, 4, 4)
+                .expect("the text must fit in a version 20 code");
+            assert_eq!(image.pixels.len(), (image.width * image.height) as usize);
+            assert!(
+                image.pixels.contains(&0),
+                "the code must have dark modules"
+            );
+            assert!(
+                image.pixels.contains(&255),
+                "the code must have light modules"
+            );
+
+            let decoded =
+                qr_decode(image.pixels, image.width, image.height).expect("the code must decode");
+            assert_eq!(decoded, text, "the text must come back unchanged");
+        }
+    }
+
+    #[test]
+    fn a_buffer_that_does_not_match_the_dimensions_is_an_error() {
+        let error = qr_decode(vec![0; 10], 100, 100).expect_err("a short buffer must be rejected");
+        assert_eq!(error.kind(), "bad_image_geometry");
+    }
+
+    #[test]
+    fn an_image_without_a_code_reports_that_rather_than_panicking() {
+        let error = qr_decode(vec![255; 64 * 64], 64, 64).expect_err("a blank image has no code");
+        assert_eq!(error.kind(), "no_qr_found");
+    }
+
+    #[test]
+    fn text_that_does_not_fit_is_rejected_rather_than_truncated() {
+        let error = qr_encode("a".repeat(8_000), FfiEcLevel::Medium, 20, 4, 4)
+            .expect_err("the text must not fit");
+        assert_eq!(error.kind(), "payload_too_large");
+    }
+
+    #[test]
+    fn zero_scale_is_rejected() {
+        let error = qr_encode("x".to_owned(), FfiEcLevel::Medium, 20, 0, 4)
+            .expect_err("zero scale cannot render");
+        assert_eq!(error.kind(), "bad_render_geometry");
+    }
+
     const RFC_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
     #[test]
@@ -2260,6 +2459,9 @@ mod tests {
                 panic!("counting characters must not hit the limit")
             }
             Err(FfiError::Core { .. }) => {}
+            Err(FfiError::Qr { .. }) => {
+                panic!("the code channel is not involved in a length check")
+            }
             Ok(_) => panic!("non-Base32 input must not parse"),
         }
     }

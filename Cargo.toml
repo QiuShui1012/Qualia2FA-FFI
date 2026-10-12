@@ -44,6 +44,13 @@ crate-type = ["cdylib", "staticlib"]
 # `Core/` submodule was removed together with the path dependency.
 qualia2fa-core = "0.1.0"
 
+# The code channel: the host draws a pairing payload (or an entry) as a QR code, and reads
+# one back from an image the user imported. The default features are on deliberately —
+# they carry `scan-image`, the decoding half, and the desktop application needs both
+# halves. Decoding takes pixels rather than an image file, so the image format decoders
+# stay on the platform side.
+qualia-transport = "0.1"
+
 # Device identity: the `DevicePublicKey` / `DeviceSignature` types live here.
 #
 # The host callbacks (`FfiDeviceKeys::get_or_create` / `sign`) return raw bytes.
