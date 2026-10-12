@@ -176,6 +176,67 @@ responder.confirm(vault, verifier.sessionId()!!, verifier.confirmation()!!)  // 
 > 例外是**版本 1 的旧文件**：那份文件里确实没有可判定的信息，需要权威确认时用
 > 挑战-应答。
 
+### 同步（`FfiSyncSession`）
+
+同步是**两台设备各出一个码、一次一个方向**：一方出示自己的状态，另一方读入并合并，
+然后反过来。载荷由核心加密并认证，通道只负责搬字节。
+
+**通道由端侧实现**（`FfiTransport`）：今天的实现是「文本/二维码」这一条，将来的
+局域网通道接在同一个位置上。
+
+```kotlin
+// 通道：一个出站队列 + 一个入站队列，不含任何判断
+class CodeChannel(private val me: String) : FfiTransport { /* … */ }
+
+val session = FfiSyncSession.open(vault)
+
+// 出示自己的状态
+session.send(channel, FfiRecipient.All, FfiPayloadKind.Vault)
+showQrCode(channel.takeOutgoing())
+
+// 读入对方的码并合并
+channel.accept(senderId, payloadBytes)
+val outcome = session.receive(channel)
+if (outcome.needsAdjudication) {
+    for (conflict in session.pendingConflicts()) {
+        showConflict(conflict)
+    }
+    session.adjudicate(conflict.entryId, FfiDecision.TakeIncoming)
+}
+vault.serialize()?.let(::saveVault)     // 合并写进了保险库，必须落盘
+```
+
+| 成员 | 说明 |
+|---|---|
+| `FfiSyncSession.open(vault)` | 在一个已解锁的保险库上开会话 |
+| `send(transport, to, kind)` → `syncId` | 封装并发出（`Vault` = 自己的全部状态，`Request` = 「把你的发给我」） |
+| `receive(transport)` → `FfiSyncOutcome` | 读入一条消息并合并；失败时保险库与重放日志都不变 |
+| `pendingConflicts()` | 还没裁决的冲突，按合并报告的先后排列 |
+| `adjudicate(entryId, decision)` | 裁决一条，**按标识而不是下标**（下标会在裁决后移位） |
+| `planShare(transport)` | 只回答装不装得下，不发送也不显示 |
+| `FfiPlatformKeys.deviceId()` | 本机设备标识，通道要如实报告它 |
+
+`FfiTransport` 的实现要求与核心 `Transport` 一致：**如实报告发送方**（核心会拿它和
+载荷里那个认证过的字段对账）、尊重 `FfiRecipient.One`、没有消息时返回 `null` 而不是
+阻塞、一次性通道第二次使用要报 `transport_already_used`。设备标识一律是 **64 位
+十六进制**。
+
+冲突的 `kind` 是稳定字符串，端侧对未知值要有兜底分支：
+
+| kind | 含义 | 两个选择 |
+|---|---|---|
+| `entry_mismatch` | 两边都有这条条目，内容不同 | 保留本机版本 / 采用对方版本 |
+| `peer_deleted` | 对方删除了它，本机改过它并留着 | 保留条目 / 接受删除 |
+| `local_deleted` | 本机删除了它，对方还留着 | 保持删除 / 恢复条目 |
+
+> **裁决只作用于本机。** 「采用对方版本」会真正写进保险库，所以**必须落盘**；
+> 「保留本机版本」不会让分歧消失——对方仍持有另一版，轮到它同步时它会问它的用户。
+> 两边都选择之后才会收敛。
+
+> **重放日志不落盘。** 同一次运行里同一个载荷不会被应用两次；重启之后日志是空的，
+> 同一个载荷可以再被合并一次——合并是幂等的，结果不变。二维码通道是带外、一次性的，
+> 这个边界因此可以接受；将来局域网通道需要它跨重启时再暴露出来。
+
 ## 错误处理
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
@@ -184,6 +245,9 @@ FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 |---|---|
 | `InputTooLong` | 输入超过边界上限 |
 | `Core` | 核心返回的错误，结构化为 `FfiCoreError { kind, message }` |
+| `Qr` | 通道自身报出的失败（`kind` + `detail`），例如图片里读不出码 |
+| `InvalidDeviceId` | 传进来的设备标识不是 64 位十六进制 |
+| `UnknownConflict` | 为一条不在等待裁决的冲突做了裁决：裁决只属于产生它的那次合并 |
 
 `kind` 是**稳定的机器可读标识**（如 `secret_empty`、`vault_entry_not_found`），
 端侧据此分流 UI；`message` 仅供展示与日志。这些字符串属于公开接口：**可以新增，
@@ -197,6 +261,8 @@ FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 | `vault_entry_not_found` | 「保险库为空」 | 显示空列表，而用户刚才还在看条目 |
 | `recovery_authentication_failed` | `recovery_file_malformed` | 用户反复试口令，而问题不在口令 |
 | `pairing_authentication_failed` | 任何更具体的错误 | 给攻击者一个「差一点就成功」的预言机 |
+| `sync_already_applied` | `sync_authentication_failed` | 把「已经合并过」报成「这个码是假的」，用户会去重新生成一个本来没问题的码 |
+| `sync_sender_mismatch` | `sync_authentication_failed` | 把「来源对不上」报成「密钥不对」，排查方向完全错 |
 
 `pairing_authentication_failed` 覆盖密文被改、会话对不上、应答来自另一次登录等
 多种成因，**这是刻意的**。端侧文案应当保持笼统（「配对失败，请重新扫码」），不要

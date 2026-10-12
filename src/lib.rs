@@ -59,13 +59,21 @@ uniffi::setup_scaffolding!();
 use std::sync::Arc;
 
 use qualia_dik::keystore::PlatformKeyStore;
-use qualia_dik::{DeviceKeyStore, DevicePublicKey, DeviceSignature, DeviceSigner};
+use qualia_dik::{
+    DEVICE_ID_LEN, DeviceId, DeviceKeyStore, DevicePublicKey, DeviceSignature, DeviceSigner,
+};
 use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::recovery::KdfParams;
+use qualia2fa_core::sync::{
+    Conflict, ConflictKind, Decision, PayloadKind, SeenSyncIds, adjudicate,
+};
+use qualia2fa_core::transport::{
+    Recipient, Roster, SharePlan, SyncSession, Transport, TransportCapabilities,
+};
 use qualia2fa_core::uri;
-use qualia2fa_core::vault::{Entry, MasterKey, VaultFile};
+use qualia2fa_core::vault::{Entry, MasterKey, Vault, VaultFile};
 use qualia2fa_core::{Error, ExposeSecret as _, SecretString};
 
 /// Length of a challenge-response session identifier.
@@ -269,6 +277,34 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::DeviceIdentityMismatch => "device_identity_mismatch",
         Error::SecureStoreWriteFailed { .. } => "secure_store_write_failed",
         Error::TimestampZero => "timestamp_zero",
+        // ── Synchronization and the channel ────────────────────────────────
+        //
+        // The sync family is mapped as a whole rather than only the variants the current
+        // screen branches on: a payload that fails to open, a log that is full and a
+        // channel that was used twice all mean different things to the user, and letting
+        // them collapse into `"unknown"` would leave the host side unable to tell them
+        // apart once it wants to.
+        Error::SyncBadMagic => "sync_bad_magic",
+        Error::SyncUnsupportedVersion { .. } => "sync_unsupported_version",
+        Error::SyncEmptyPayload => "sync_empty_payload",
+        Error::SyncTruncated => "sync_truncated",
+        Error::SyncRecordCountMismatch { .. } => "sync_record_count_mismatch",
+        Error::SyncTooManyRecords { .. } => "sync_too_many_records",
+        Error::SyncCompressionFailed => "sync_compression_failed",
+        Error::SyncDecompressionFailed => "sync_decompression_failed",
+        Error::SyncPayloadTooLarge { .. } => "sync_payload_too_large",
+        Error::SyncUnknownRecordKind { .. } => "sync_unknown_record_kind",
+        Error::SyncMalformed { .. } => "sync_malformed",
+        Error::SyncAuthenticationFailed => "sync_authentication_failed",
+        Error::SyncAlreadyApplied => "sync_already_applied",
+        Error::SyncIdLogFull { .. } => "sync_id_log_full",
+        Error::SyncSenderMismatch => "sync_sender_mismatch",
+        Error::SyncUnknownPayloadKind { .. } => "sync_unknown_payload_kind",
+        Error::SyncNoSessionFound => "sync_no_session_found",
+        Error::TransportFailed { .. } => "transport_failed",
+        Error::TransportUnsupported { .. } => "transport_unsupported",
+        Error::TransportAlreadyUsed => "transport_already_used",
+        Error::TransportMessageTooLarge { .. } => "transport_message_too_large",
         _ => "unknown",
     }
 }
@@ -286,6 +322,8 @@ impl FfiError {
             FfiError::InputTooLong { .. } => "input_too_long",
             FfiError::Core { detail } => &detail.kind,
             FfiError::Qr { kind, .. } => kind,
+            FfiError::InvalidDeviceId { .. } => "invalid_device_id",
+            FfiError::UnknownConflict { .. } => "unknown_conflict",
         }
     }
 }
@@ -363,6 +401,31 @@ pub enum FfiError {
         kind: String,
         /// Human-readable detail. Never contains a payload or a secret.
         detail: String,
+    },
+
+    /// An identifier handed across the boundary is not in the form this layer documents.
+    ///
+    /// Device identifiers cross as 64 hexadecimal characters (see [`FfiTransport`]). A
+    /// value of another shape is a **host-side** mistake — a truncated copy, or a
+    /// fingerprint formatted with separators — and reading it as some other device would
+    /// attribute a payload to the wrong sender, which is what the sender check exists to
+    /// prevent.
+    #[error("{kind} is not 64 hexadecimal characters")]
+    InvalidDeviceId {
+        /// Which identifier was wrong (`device_id`), so the host side can point at it.
+        kind: String,
+    },
+
+    /// A decision was handed over for a conflict that is not waiting.
+    ///
+    /// The conflicts of a receive replace the ones before them, so a decision kept from an
+    /// older merge names nothing. Refusing it is deliberate: applying a decision to
+    /// whatever now sits under that identifier is how a user ends up with content they
+    /// never chose.
+    #[error("no conflict is waiting for entry {entry_id}")]
+    UnknownConflict {
+        /// The entry identifier the decision named, as it was passed in.
+        entry_id: String,
     },
 }
 
@@ -1030,10 +1093,14 @@ impl qualia2fa_core::flow::SecureStore for ForeignSecureStore {
 fn ffi_to_core_error(source: FfiError) -> Error {
     match source {
         FfiError::Core { detail } => kind_to_core_error(&detail.kind),
-        // Neither of the boundary's own errors can arrive from a host callback: the code
-        // channel is called from the host, not into it. They degrade the same way as any
+        // None of the boundary's own errors can arrive from a host callback: the code
+        // channel is called from the host, not into it, and an identifier or a conflict
+        // named by the host is checked where it is used. They degrade the same way as any
         // other error that has no core equivalent.
-        FfiError::InputTooLong { .. } | FfiError::Qr { .. } => Error::DeviceKeyMissing,
+        FfiError::InputTooLong { .. }
+        | FfiError::Qr { .. }
+        | FfiError::InvalidDeviceId { .. }
+        | FfiError::UnknownConflict { .. } => Error::DeviceKeyMissing,
     }
 }
 
@@ -1166,6 +1233,23 @@ impl FfiPlatformKeys {
     pub fn device_public_key(&self) -> Result<Vec<u8>, FfiError> {
         let signer = self.signer()?;
         Ok(signer.public_key().as_sec1_bytes().to_vec())
+    }
+
+    /// The fingerprint of this device's identity: 64 hexadecimal characters.
+    ///
+    /// It is the identifier a sync payload carries as its sender, the value the channel
+    /// reports for this device (see [`FfiTransport::local_device`]), and the string a
+    /// pairing screen shows next to a requester. All three are the **same value by
+    /// construction**: the fingerprint is derived from the public key, so two devices that
+    /// show the same string really do hold the same identity, with no registry to keep in
+    /// step and nothing to forge.
+    ///
+    /// # Errors
+    ///
+    /// A [`FfiError::Core`] error when the identity cannot be opened: it was deleted, this
+    /// is a different user account, or no key store is available.
+    pub fn device_id(&self) -> Result<String, FfiError> {
+        Ok(self.signer()?.public_key().device_id().to_hex())
     }
 
     /// Signs the **raw message** with the identity under this object's label and
@@ -2358,6 +2442,728 @@ fn kdf_params(
     )?)
 }
 
+// ── Synchronization: the channel contract and one session ────────────────
+//
+// The core owns the protocol: which payload goes first, what a merge does, what a conflict
+// means. This half only moves data across the boundary:
+//
+//   - the host side implements a channel (`FfiTransport`), which is where a real
+//     transport lives (today the text/QR code channel, later a LAN one);
+//   - `FfiSyncSession` drives one exchange against such a channel.
+//
+// Nothing here decides anything. A review of this section has one question: **has any
+// protocol rule been copied in from the core?**
+
+/// How many parties take part in one sync.
+///
+/// Mirrors [`qualia2fa_core::transport::Roster`]. The distinction has to be declared by
+/// the channel rather than guessed by the caller: the same code is two-party over QR codes
+/// and may be multi-party for the same use over a LAN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRoster {
+    /// Exactly two parties. Transfer starts as soon as they connect.
+    TwoParty,
+    /// Three or more parties. The initiator decides when to start.
+    MultiParty,
+}
+
+impl From<FfiRoster> for Roster {
+    fn from(value: FfiRoster) -> Self {
+        match value {
+            FfiRoster::TwoParty => Self::TwoParty,
+            FfiRoster::MultiParty => Self::MultiParty,
+        }
+    }
+}
+
+/// What a channel can do.
+///
+/// Mirrors [`qualia2fa_core::transport::TransportCapabilities`]; see it for the meaning of
+/// each field. Two points matter at this boundary:
+///
+/// - **The values are a declaration, not a probe.** They must be available before the
+///   exchange starts, so the caller can pick a mode before anything is displayed.
+/// - **`max_message_len` is one message**, not one physical artifact: a channel that shows
+///   several codes in sequence declares the sum over all of them, and how the bytes are cut
+///   into frames is the channel's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTransportCapabilities {
+    /// Roster of this channel.
+    pub roster: FfiRoster,
+    /// Per-message byte limit; `None` means a byte stream with no limit.
+    pub max_message_len: Option<u64>,
+    /// Largest QR version this channel may display, if it displays codes.
+    pub max_qr_version: Option<u8>,
+    /// Whether this channel may be used only once (QR codes are).
+    pub single_use: bool,
+    /// Whether this channel can carry a whole payload, or only link establishment.
+    pub can_carry_payload: bool,
+}
+
+impl From<FfiTransportCapabilities> for TransportCapabilities {
+    fn from(value: FfiTransportCapabilities) -> Self {
+        Self {
+            roster: value.roster.into(),
+            // A limit wider than this platform can address is treated as the largest one
+            // it can: the direction is safe (a channel never gets a limit larger than it
+            // declared) and the value is far beyond any real message.
+            max_message_len: value
+                .max_message_len
+                .map(|len| usize::try_from(len).unwrap_or(usize::MAX)),
+            max_qr_version: value.max_qr_version,
+            single_use: value.single_use,
+            can_carry_payload: value.can_carry_payload,
+        }
+    }
+}
+
+/// The recipient of one message.
+///
+/// Mirrors [`qualia2fa_core::transport::Recipient`]. The recipient is an explicit parameter
+/// rather than left implicit: on a channel with several peers, "forward this to one peer"
+/// and "broadcast" are two different actions.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRecipient {
+    /// Send to this peer only: a 64-character hexadecimal device identifier.
+    One {
+        /// Device identifier, hexadecimal.
+        device_id: String,
+    },
+    /// Send to every peer of the current session.
+    All,
+}
+
+impl TryFrom<FfiRecipient> for Recipient {
+    type Error = FfiError;
+
+    fn try_from(value: FfiRecipient) -> Result<Self, FfiError> {
+        Ok(match value {
+            FfiRecipient::One { device_id } => Self::One(parse_device_id(&device_id)?),
+            FfiRecipient::All => Self::All,
+        })
+    }
+}
+
+/// One message taken off a channel, together with the sender the channel claims.
+///
+/// Mirrors the return value of [`qualia2fa_core::transport::Transport::receive`]. The
+/// `sender` is the **channel's claim**, and the core compares it with the sender inside the
+/// payload: the payload's own field proves only that nobody changed it, while "who actually
+/// handed this over" is something only the channel knows.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiReceivedMessage {
+    /// The sending device as the channel reports it, hexadecimal.
+    pub sender: String,
+    /// The message bytes.
+    pub message: Vec<u8>,
+}
+
+/// A channel that can move sync payloads. **Implemented by the host side.**
+///
+/// Corresponds to [`qualia2fa_core::transport::Transport`]. An implementation forwards to a
+/// real transport, **with no decisions of its own**: every protocol rule (what the bytes
+/// mean, whether a payload was already applied, whether a sender is acceptable) lives in the
+/// core.
+///
+/// # Contract the implementation must satisfy
+///
+/// 1. **`receive` must report the sender truthfully**, not just hand back bytes. On a
+///    broadcast channel any device can replay a payload someone else sent, so "the payload
+///    says it is from B" and "C actually sent it" can hold at the same time. The core turns
+///    the comparison into a hard check, so misreporting the sender only makes the sync fail.
+/// 2. **`send` must respect [`FfiRecipient`]**; `One` must not degrade into a broadcast.
+/// 3. **`receive` must not block indefinitely.** With no message available it returns
+///    `Ok(None)`, which the core reports as "no session found"; how long to wait is the
+///    host side's decision, because the core has no clock.
+/// 4. **A `single_use` channel must fail its second use** with
+///    [`FfiError::Qr`]`{ kind: "transport_already_used" }`.
+/// 5. **Device identifiers are 64 hexadecimal characters**: the 32-byte device fingerprint
+///    (`qualia_dik::DeviceId`), the same value the pairing flow shows as a device identity.
+#[uniffi::export(with_foreign)]
+pub trait FfiTransport: Send + Sync {
+    /// What this channel can do.
+    fn capabilities(&self) -> FfiTransportCapabilities;
+
+    /// This device's identifier, hexadecimal.
+    ///
+    /// It fills in the `sender` of outgoing payloads, so both sides of an exchange agree on
+    /// who sent what.
+    fn local_device(&self) -> String;
+
+    /// Sends one message.
+    fn send(&self, to: FfiRecipient, message: Vec<u8>) -> Result<(), FfiError>;
+
+    /// Takes one message off the channel.
+    ///
+    /// `Ok(None)` means "nothing available right now", which is a normal state and not an
+    /// error; `Err` means the channel itself failed.
+    fn receive(&self) -> Result<Option<FfiReceivedMessage>, FfiError>;
+
+    /// Every peer in the current session.
+    ///
+    /// Zero or one element on a two-party channel. This defines what `All` means.
+    fn peers(&self) -> Result<Vec<String>, FfiError>;
+}
+
+/// Forwarding implementation of the core `Transport`: bridges trait calls to the host-side
+/// channel, after parsing this device's identifier **once** when the adapter is built.
+///
+/// Parsing up front is what makes it possible to satisfy the core trait at all: the core
+/// asks for `local_device()` as a value that cannot fail, so an identifier that cannot be
+/// parsed has to be reported before the session starts rather than in the middle of it.
+struct ForeignTransport {
+    /// The host-side channel.
+    channel: Arc<dyn FfiTransport>,
+    /// This device's identifier, parsed once.
+    me: DeviceId,
+}
+
+impl ForeignTransport {
+    /// Builds the adapter, rejecting an unparsable local device identifier.
+    fn new(channel: Arc<dyn FfiTransport>) -> Result<Self, FfiError> {
+        let me = parse_device_id(&channel.local_device())?;
+        Ok(Self { channel, me })
+    }
+}
+
+impl Transport for ForeignTransport {
+    fn capabilities(&self) -> TransportCapabilities {
+        self.channel.capabilities().into()
+    }
+
+    fn local_device(&self) -> DeviceId {
+        self.me
+    }
+
+    fn send(&self, to: Recipient, message: &[u8]) -> Result<(), Error> {
+        let to = match to {
+            Recipient::One(id) => FfiRecipient::One {
+                device_id: id.to_hex(),
+            },
+            Recipient::All => FfiRecipient::All,
+        };
+        self.channel
+            .send(to, message.to_vec())
+            .map_err(transport_error_to_core_error)
+    }
+
+    fn receive(&self) -> Result<(DeviceId, Vec<u8>), Error> {
+        match self
+            .channel
+            .receive()
+            .map_err(transport_error_to_core_error)?
+        {
+            Some(received) => {
+                let sender =
+                    parse_device_id(&received.sender).map_err(|_| Error::TransportFailed {
+                        reason: "the channel reported a device identifier that is not hexadecimal",
+                    })?;
+                Ok((sender, received.message))
+            }
+            None => Err(Error::SyncNoSessionFound),
+        }
+    }
+
+    fn peers(&self) -> Result<Vec<DeviceId>, Error> {
+        self.channel
+            .peers()
+            .map_err(transport_error_to_core_error)?
+            .iter()
+            .map(|id| {
+                parse_device_id(id).map_err(|_| Error::TransportFailed {
+                    reason: "the channel reported a device identifier that is not hexadecimal",
+                })
+            })
+            .collect()
+    }
+}
+
+/// Parses a device identifier: exactly 64 hexadecimal characters.
+///
+/// The form is the one every other device identifier at this boundary uses (see
+/// [`FfiTransport`] point 5), so a value taken from a pairing screen can be compared with
+/// one from a sync payload without conversion.
+fn parse_device_id(text: &str) -> Result<DeviceId, FfiError> {
+    let invalid = || FfiError::InvalidDeviceId {
+        kind: "device_id".to_owned(),
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() != DEVICE_ID_LEN * 2 {
+        return Err(invalid());
+    }
+
+    let mut id = [0_u8; DEVICE_ID_LEN];
+    for (index, slot) in id.iter_mut().enumerate() {
+        let high = hex_digit(bytes[index * 2]).map_err(|_| invalid())?;
+        let low = hex_digit(bytes[index * 2 + 1]).map_err(|_| invalid())?;
+        *slot = (high << 4) | low;
+    }
+    Ok(DeviceId::from_bytes(id))
+}
+
+/// Converts a failure reported by a host-side channel back into a core error.
+///
+/// The channel reports failures as [`FfiError::Qr`], whose `kind` is stable (see
+/// [`FfiError::kind`]). Two of them have a core equivalent the protocol reacts to, and they
+/// are the two where the reaction differs:
+///
+/// - `transport_already_used`: a one-shot channel was used twice.
+/// - `sync_no_session_found`: nothing to receive. A channel that prefers `Ok(None)` for
+///   that state never produces it, but one that carries the core's wording does.
+///
+/// Everything else becomes [`Error::TransportFailed`] with an opaque reason: the channel's
+/// own message belongs to the channel and is not part of the protocol layer.
+fn transport_error_to_core_error(source: FfiError) -> Error {
+    match &source {
+        FfiError::Qr { kind, .. } if kind == "transport_already_used" => {
+            Error::TransportAlreadyUsed
+        }
+        FfiError::Qr { kind, .. } if kind == "sync_no_session_found" => Error::SyncNoSessionFound,
+        _ => Error::TransportFailed {
+            reason: "the host-side channel reported a failure",
+        },
+    }
+}
+
+/// What a payload asks the peer to do.
+///
+/// Mirrors [`qualia2fa_core::sync::PayloadKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPayloadKind {
+    /// The sender's full state: accept it and merge.
+    Vault,
+    /// A request: send me your full state.
+    Request,
+}
+
+impl From<FfiPayloadKind> for PayloadKind {
+    fn from(value: FfiPayloadKind) -> Self {
+        match value {
+            FfiPayloadKind::Vault => Self::Vault,
+            FfiPayloadKind::Request => Self::Request,
+        }
+    }
+}
+
+/// Which route one share takes.
+///
+/// Mirrors [`qualia2fa_core::transport::SharePlan`]. "Does not fit" is a route, not a
+/// failure: a request (which carries no records) goes out first and the payload is left to a
+/// channel that can carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSharePlan {
+    /// The whole payload fits this channel.
+    FullPayload {
+        /// Size in bytes after sealing.
+        len: u64,
+    },
+    /// It does not fit: a link on another channel is needed first.
+    LinkEstablishment {
+        /// Number of bytes the payload needs.
+        needed: u64,
+        /// Largest number of bytes this channel can carry.
+        limit: u64,
+    },
+}
+
+impl From<SharePlan> for FfiSharePlan {
+    fn from(value: SharePlan) -> Self {
+        match value {
+            SharePlan::FullPayload { len } => Self::FullPayload { len: len as u64 },
+            SharePlan::LinkEstablishment { needed, limit } => Self::LinkEstablishment {
+                needed: needed as u64,
+                limit: limit as u64,
+            },
+        }
+    }
+}
+
+/// What the user decided about one conflict.
+///
+/// Mirrors [`qualia2fa_core::sync::Decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiDecision {
+    /// Keep the state of this device; the peer's version is discarded.
+    KeepLocal,
+    /// Take the peer's version, discarding the state of this device.
+    TakeIncoming,
+}
+
+impl From<FfiDecision> for Decision {
+    fn from(value: FfiDecision) -> Self {
+        match value {
+            FfiDecision::KeepLocal => Self::KeepLocal,
+            FfiDecision::TakeIncoming => Self::TakeIncoming,
+        }
+    }
+}
+
+/// One side of a conflict, as far as it can be shown.
+///
+/// **No secret crosses here.** A conflict is displayed so the user can tell two versions
+/// apart, and a name, a service, an account and a note are what that needs; the seed would
+/// only add a second copy of key material in the host process, where it cannot be erased.
+/// The decision itself is applied inside Rust, from the copy the conflict already holds.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConflictSide {
+    /// Display name.
+    pub name: String,
+    /// Issuer (service name), if any.
+    pub issuer: Option<String>,
+    /// Account name.
+    pub account: String,
+    /// Note.
+    pub note: String,
+    /// Last modification time of this version (Unix seconds, from the device that wrote it).
+    pub updated_at: u64,
+}
+
+impl FfiConflictSide {
+    /// Reads the displayable fields of one entry.
+    fn from_entry(entry: &Entry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            issuer: entry.issuer.clone(),
+            account: entry.account.clone(),
+            note: entry.note.clone(),
+            updated_at: entry.updated_at,
+        }
+    }
+}
+
+/// One disagreement a human has to settle.
+///
+/// The fields are **normalized**, which is not how the core stores them: there,
+/// `DeletionConflict` keeps the peer's record in one field and the local tombstone in
+/// another, because that is what has to be written back. Here:
+///
+/// - `local` is the live entry **this device** holds, if it holds one;
+/// - `incoming` is the live entry the **peer** sent, if it sent one.
+///
+/// A tombstone has nothing to display, so the side that deleted is `None`. Which side
+/// deleted is what `kind` says.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConflict {
+    /// The entry in disagreement, as 32 hexadecimal characters.
+    pub entry_id: String,
+    /// Stable identifier of the shape; see [`conflict_kind`].
+    pub kind: String,
+    /// The local version, when this device holds a live entry.
+    pub local: Option<FfiConflictSide>,
+    /// The peer's version, when the peer sent a live entry.
+    pub incoming: Option<FfiConflictSide>,
+    /// Whether the local version is the later one.
+    ///
+    /// A **hint for the user interface**, not a basis for a decision: the peer fills in its
+    /// own timestamps. The core never picks a side from it, and neither does the host side.
+    pub local_is_newer: bool,
+}
+
+impl FfiConflict {
+    /// Converts one conflict for display, normalizing the two sides.
+    ///
+    /// The local side of `peer_deleted` is **read from the vault** rather than taken from
+    /// the conflict: the core leaves it out on purpose (it is already stored, and copying
+    /// it would duplicate key material for a screen that only shows names), so the vault is
+    /// where that version lives.
+    fn from_core(conflict: &Conflict, vault: &Vault) -> Self {
+        let (local, incoming, local_is_newer) = match &conflict.kind {
+            ConflictKind::EntryMismatch { local, incoming } => (
+                Some(FfiConflictSide::from_entry(local)),
+                Some(FfiConflictSide::from_entry(incoming)),
+                false,
+            ),
+            ConflictKind::DeletionConflict {
+                local,
+                local_is_newer,
+                ..
+            } => (
+                vault
+                    .get(&conflict.entry_id)
+                    .map(FfiConflictSide::from_entry),
+                local
+                    .as_ref()
+                    .map(|entry| FfiConflictSide::from_entry(entry)),
+                *local_is_newer,
+            ),
+        };
+        Self {
+            entry_id: conflict.entry_id.to_string(),
+            kind: conflict_kind(conflict).to_owned(),
+            local,
+            incoming,
+            local_is_newer,
+        }
+    }
+}
+
+/// Names the shape of a conflict, in the form the host side branches on.
+///
+/// # Stability contract
+///
+/// These strings are part of the public interface: new values may be added, but an existing
+/// one must not be renamed or change meaning. A client must have a fallback branch for
+/// values it does not know, because a newer library may report a shape it has never seen.
+///
+/// | value | meaning | deciding |
+/// |---|---|---|
+/// | `entry_mismatch` | both sides hold a live entry with different content | either version |
+/// | `peer_deleted` | the peer reports a deletion; this device holds a newer entry | keep the entry, or accept the deletion |
+/// | `local_deleted` | this device reports a deletion; the peer still holds an entry | keep it deleted, or restore the peer's entry |
+#[must_use]
+pub fn conflict_kind(conflict: &Conflict) -> &'static str {
+    match &conflict.kind {
+        ConflictKind::EntryMismatch { .. } => "entry_mismatch",
+        ConflictKind::DeletionConflict { local: None, .. } => "peer_deleted",
+        ConflictKind::DeletionConflict { local: Some(_), .. } => "local_deleted",
+    }
+}
+
+/// The result of one receive.
+///
+/// Mirrors [`qualia2fa_core::transport::SyncOutcome`], with the counters as plain numbers so
+/// the host side can summarize a sync without looking at the conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiSyncOutcome {
+    /// Identifier of the payload just processed, hexadecimal.
+    pub sync_id: String,
+    /// Number of entries added.
+    pub added: u64,
+    /// Number of tombstones added.
+    pub tombstones_added: u64,
+    /// Number of deletions applied.
+    pub deletions_applied: u64,
+    /// Number of records whose content was already identical.
+    pub unchanged: u64,
+    /// Whether this sync changed nothing at all.
+    ///
+    /// Reported by the core rather than computed here: "nothing changed" and "everything
+    /// was already there" are one condition, and assembling it at a second place is how the
+    /// two stop agreeing.
+    pub made_no_change: bool,
+    /// Whether conflicts are waiting for a decision.
+    pub needs_adjudication: bool,
+    /// The conflicts themselves, to show the user.
+    pub conflicts: Vec<FfiConflict>,
+}
+
+/// One synchronization session against one channel.
+///
+/// # It borrows the vault, so the vault must not be reassigned while it is used
+///
+/// The session works on the [`FfiVault`] object it was opened with. The host side keeps that
+/// object alive; the merge writes into it, and the host side **must persist it afterwards**
+/// ([`FfiVault::serialize`]) or the merged records are lost when the process ends.
+///
+/// # The replay log lives in this object
+///
+/// The core keeps a log of processed payload identifiers so that the same payload is not
+/// decrypted and merged again. It is not persisted, for the same reason the pairing session
+/// is not: a log written to disk is another store to keep in step with the vault, and the
+/// code channel is out-of-band and one-shot, so the practical exposure is a user who
+/// re-applies a code they already applied — which merges to the same content. A long-lived
+/// broadcast channel (a LAN) will need the log to survive a restart, and that is the point
+/// at which it becomes worth persisting.
+///
+/// # Only one exchange at a time
+///
+/// A session accepts payloads from **any** peer: the channel it is used with has confirmed
+/// the peer out of band (the user carried the code). A channel that carries several peers
+/// has to restrict them instead, and that entry point is not exposed yet, because no such
+/// channel exists.
+#[derive(uniffi::Object)]
+pub struct FfiSyncSession {
+    /// The vault being synchronized: master key and records both stay on this side.
+    vault: Arc<FfiVault>,
+    /// Identifiers of the payloads already processed.
+    seen: std::sync::Mutex<SeenSyncIds>,
+    /// Conflicts of the last receive that are waiting for a decision.
+    pending: std::sync::Mutex<Vec<Conflict>>,
+}
+
+#[uniffi::export]
+impl FfiSyncSession {
+    /// Opens a session on an unlocked vault.
+    #[uniffi::constructor]
+    pub fn open(vault: Arc<FfiVault>) -> Arc<Self> {
+        Arc::new(Self {
+            vault,
+            seen: std::sync::Mutex::new(SeenSyncIds::new()),
+            pending: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Asks which route sharing this vault's state takes on `transport`.
+    ///
+    /// Sends nothing and displays nothing: the answer is needed **before** a code is shown,
+    /// and [`FfiSyncSession::send`] seals and sends in one step, leaving no chance to look
+    /// at the size first.
+    pub fn plan_share(&self, transport: Arc<dyn FfiTransport>) -> Result<FfiSharePlan, FfiError> {
+        let transport = ForeignTransport::new(transport)?;
+        let mut vault = self.vault.lock();
+        let mut seen = self.lock_seen();
+        let (master, contents) = vault.split_mut();
+        let session = SyncSession::open(master, contents, &mut seen);
+        Ok(session.plan_share(&transport)?.into())
+    }
+
+    /// Seals this vault's state (or a request for the peer's) and sends it.
+    ///
+    /// Returns the payload identifier, hexadecimal. The payload is **not** recorded in the
+    /// replay log: that log holds what this device received, and recording an outgoing
+    /// payload would make this device reject its own payload when a peer sends it back.
+    pub fn send(
+        &self,
+        transport: Arc<dyn FfiTransport>,
+        to: FfiRecipient,
+        kind: FfiPayloadKind,
+    ) -> Result<String, FfiError> {
+        let transport = ForeignTransport::new(transport)?;
+        let to = Recipient::try_from(to)?;
+        let mut vault = self.vault.lock();
+        let mut seen = self.lock_seen();
+        let (master, contents) = vault.split_mut();
+        let session = SyncSession::open(master, contents, &mut seen);
+        Ok(to_hex(&session.send(&transport, to, kind.into())?))
+    }
+
+    /// Receives one message and merges its records into the vault.
+    ///
+    /// The conflicts of this receive **replace** the ones still waiting from the previous
+    /// one: a decision belongs to the merge that reported it, and carrying a conflict
+    /// forward from an older merge would apply a decision to content the user is no longer
+    /// looking at. The host side must decide before receiving again, or accept that those
+    /// conflicts are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Every rejected payload keeps its own error: `sync_no_session_found` when the channel
+    /// had nothing, `sync_already_applied` for a payload that was already processed,
+    /// `sync_sender_mismatch` when the envelope's sender and the payload's disagree, and the
+    /// authentication failures of the payload itself. **Both the vault and the replay log are
+    /// left unchanged** when it fails.
+    pub fn receive(&self, transport: Arc<dyn FfiTransport>) -> Result<FfiSyncOutcome, FfiError> {
+        let transport = ForeignTransport::new(transport)?;
+
+        let (record, conflicts) = {
+            let mut vault = self.vault.lock();
+            let mut seen = self.lock_seen();
+            let (master, contents) = vault.split_mut();
+            let mut session = SyncSession::open(master, contents, &mut seen);
+            let outcome = session.receive(&transport)?;
+
+            let made_no_change = outcome.made_no_change();
+            let needs_adjudication = outcome.needs_adjudication();
+            let merge = outcome.merge;
+            let record = FfiSyncOutcome {
+                sync_id: to_hex(&outcome.sync_id),
+                added: merge.added as u64,
+                tombstones_added: merge.tombstones_added as u64,
+                deletions_applied: merge.deletions_applied as u64,
+                unchanged: merge.unchanged as u64,
+                made_no_change,
+                needs_adjudication,
+                conflicts: merge
+                    .conflicts
+                    .iter()
+                    .map(|conflict| FfiConflict::from_core(conflict, vault.vault()))
+                    .collect(),
+            };
+            (record, merge.conflicts)
+        };
+
+        *self.lock_pending() = conflicts;
+        Ok(record)
+    }
+
+    /// The conflicts waiting for a decision, in the order the merge reported them.
+    #[must_use]
+    pub fn pending_conflicts(&self) -> Vec<FfiConflict> {
+        let vault = self.vault.lock();
+        self.lock_pending()
+            .iter()
+            .map(|conflict| FfiConflict::from_core(conflict, vault.vault()))
+            .collect()
+    }
+
+    /// Applies one decision to the vault.
+    ///
+    /// `entry_id` names the conflict, which is the identifier the conflict record carries.
+    /// An identifier rather than a position on purpose: a position shifts as soon as one
+    /// conflict is decided, and a caller that kept the list it displayed would then decide
+    /// the wrong entry.
+    ///
+    /// What each decision means for each shape is documented on
+    /// [`qualia2fa_core::sync::Decision`]; the rules stay in the core.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::UnknownConflict`] when nothing is waiting for that identifier, and the
+    /// core's error when the conflict no longer describes the vault (the entry was deleted
+    /// or re-created in the meantime). Nothing is written when the call fails, and the
+    /// conflict stays pending.
+    pub fn adjudicate(&self, entry_id: String, decision: FfiDecision) -> Result<(), FfiError> {
+        let conflict = {
+            let mut pending = self.lock_pending();
+            let index = pending
+                .iter()
+                .position(|conflict| conflict.entry_id.to_string() == entry_id)
+                .ok_or_else(|| FfiError::UnknownConflict {
+                    entry_id: entry_id.clone(),
+                })?;
+            pending.remove(index)
+        };
+
+        let outcome = {
+            let mut vault = self.vault.lock();
+            adjudicate(vault.vault_mut(), &conflict, decision.into())
+        };
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // The decision did not apply, so the conflict is still open and has to stay
+                // where the caller can see it.
+                self.lock_pending().push(conflict);
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl FfiSyncSession {
+    /// Takes the replay-log lock, ignoring poisoning (see [`FfiVault::lock`]).
+    fn lock_seen(&self) -> std::sync::MutexGuard<'_, SeenSyncIds> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes the pending-conflict lock, ignoring poisoning.
+    ///
+    /// **Lock order**: this lock is taken while the vault lock is held in
+    /// [`FfiSyncSession::pending_conflicts`], so the vault always comes first.
+    /// [`FfiSyncSession::adjudicate`] takes a conflict **out** of the list and releases this
+    /// lock before it reaches for the vault, so the two orders never nest into a cycle.
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Vec<Conflict>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Lower-case hexadecimal form of a byte string.
+///
+/// Same form as every other identifier at this boundary; the core's own `Display` is used
+/// where the type has one (`EntryId`), and this covers the raw byte strings that do not.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0F), 16).unwrap_or('0'));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2471,6 +3277,7 @@ mod tests {
             Err(FfiError::Qr { .. }) => {
                 panic!("the code channel is not involved in a length check")
             }
+            Err(other) => panic!("unexpected error kind {}", other.kind()),
             Ok(_) => panic!("non-Base32 input must not parse"),
         }
     }
@@ -2991,6 +3798,18 @@ mod tests {
             core_error_kind(&Error::RecoveryAuthenticationFailed),
             core_error_kind(&Error::AuthProofFailed),
             core_error_kind(&Error::TimestampZero),
+            core_error_kind(&Error::SyncAlreadyApplied),
+            core_error_kind(&Error::SyncNoSessionFound),
+            core_error_kind(&Error::SyncSenderMismatch),
+            core_error_kind(&Error::SyncAuthenticationFailed),
+            core_error_kind(&Error::SyncIdLogFull { limit: 4096 }),
+            core_error_kind(&Error::TransportFailed { reason: "test" }),
+            core_error_kind(&Error::TransportAlreadyUsed),
+            core_error_kind(&Error::TransportMessageTooLarge {
+                needed: 100,
+                limit: 10,
+            }),
+            core_error_kind(&Error::TransportUnsupported { operation: "test" }),
         ];
         for kind in kinds {
             assert_ne!(kind, "unknown", "a variant is not mapped to a stable kind");
@@ -3105,5 +3924,527 @@ mod tests {
 
         DeviceKeyStore::delete(&keys.store, label.as_str())
             .expect("the test identity should be removable");
+    }
+
+    // ── Synchronization across the boundary ──────────────────────────
+
+    /// A channel for tests: two queues and no protocol of its own.
+    ///
+    /// It makes no decisions on purpose. A channel that de-duplicated, reordered or
+    /// retried would hide exactly the defects these tests are looking for, because every
+    /// protocol rule is supposed to live in the core.
+    struct MemoryChannel {
+        /// This device's identifier, hexadecimal.
+        me: String,
+        /// The capabilities this channel declares.
+        caps: FfiTransportCapabilities,
+        /// Outbound queue: `(recipient, bytes)`.
+        outbox: std::sync::Mutex<Vec<(FfiRecipient, Vec<u8>)>>,
+        /// Inbound queue, with the sender the channel claims for each message.
+        inbox: std::sync::Mutex<Vec<FfiReceivedMessage>>,
+        /// Peers this channel claims.
+        peers: Vec<String>,
+    }
+
+    impl MemoryChannel {
+        /// An empty two-party channel for the device with this identifier.
+        fn new(me: String) -> Self {
+            Self {
+                me,
+                caps: FfiTransportCapabilities {
+                    roster: FfiRoster::TwoParty,
+                    // The code channel of the application is text: the user carries the
+                    // payload by hand, so it has no per-message limit.
+                    max_message_len: None,
+                    max_qr_version: None,
+                    single_use: false,
+                    can_carry_payload: true,
+                },
+                outbox: std::sync::Mutex::new(Vec::new()),
+                inbox: std::sync::Mutex::new(Vec::new()),
+                peers: Vec::new(),
+            }
+        }
+
+        /// Moves this channel's outbound queue into another channel's inbound queue.
+        ///
+        /// The outbound queue is **not** cleared, so one payload can be delivered again —
+        /// which is how the replay cases are exercised.
+        ///
+        /// With `honest` set to `false` the claimed sender is replaced by this channel's
+        /// own identifier, which models a third party handing over somebody else's payload.
+        fn deliver_to(&self, target: &Self, honest: bool) {
+            let outbox = self.outbox.lock().expect("no lock poisoning in tests");
+            let mut inbox = target.inbox.lock().expect("no lock poisoning in tests");
+            for (recipient, bytes) in outbox.iter() {
+                let addressed = match recipient {
+                    FfiRecipient::All => true,
+                    FfiRecipient::One { device_id } => *device_id == target.me,
+                };
+                if !addressed {
+                    continue;
+                }
+                inbox.push(FfiReceivedMessage {
+                    sender: if honest {
+                        self.me.clone()
+                    } else {
+                        target.me.clone()
+                    },
+                    message: bytes.clone(),
+                });
+            }
+        }
+
+        /// Discards every message in the outbound queue.
+        fn clear_outbox(&self) {
+            self.outbox
+                .lock()
+                .expect("no lock poisoning in tests")
+                .clear();
+        }
+
+        /// Pushes a message straight into the inbound queue, as an attacker would.
+        fn inject(&self, claimed_sender: String, message: Vec<u8>) {
+            self.inbox
+                .lock()
+                .expect("no lock poisoning in tests")
+                .push(FfiReceivedMessage {
+                    sender: claimed_sender,
+                    message,
+                });
+        }
+    }
+
+    impl FfiTransport for MemoryChannel {
+        fn capabilities(&self) -> FfiTransportCapabilities {
+            self.caps
+        }
+
+        fn local_device(&self) -> String {
+            self.me.clone()
+        }
+
+        fn send(&self, to: FfiRecipient, message: Vec<u8>) -> Result<(), FfiError> {
+            self.outbox
+                .lock()
+                .expect("no lock poisoning in tests")
+                .push((to, message));
+            Ok(())
+        }
+
+        fn receive(&self) -> Result<Option<FfiReceivedMessage>, FfiError> {
+            let mut inbox = self.inbox.lock().expect("no lock poisoning in tests");
+            if inbox.is_empty() {
+                // "Nothing available" is a state, not a failure.
+                return Ok(None);
+            }
+            Ok(Some(inbox.remove(0)))
+        }
+
+        fn peers(&self) -> Result<Vec<String>, FfiError> {
+            Ok(self.peers.clone())
+        }
+    }
+
+    /// A device identifier for tests: one hexadecimal digit repeated to 64 characters.
+    fn test_device_id(digit: char) -> String {
+        std::iter::repeat_n(digit, 64).collect()
+    }
+
+    /// Registers a vault and hands back the store holding its master key.
+    fn registered_vault(label: &str) -> (Arc<FfiVault>, Arc<TestStore>) {
+        let store = Arc::new(TestStore::default());
+        let vault = FfiVault::register(
+            Arc::new(TestKeys::default()),
+            store.clone(),
+            label.to_owned(),
+        )
+        .expect("registration should succeed");
+        (vault, store)
+    }
+
+    /// The second device of the same account: the same master key, its own empty vault.
+    fn vault_of_the_same_account(store: &TestStore) -> Arc<FfiVault> {
+        let master = store
+            .master
+            .lock()
+            .expect("no lock poisoning in tests")
+            .clone()
+            .expect("the account is registered, so a master key exists");
+        FfiVault::from_master_key(master).expect("32 bytes are a master key")
+    }
+
+    /// Two devices of one account, both holding the same entry.
+    struct TwoDevices {
+        /// The first device's vault.
+        vault_a: Arc<FfiVault>,
+        /// The second device's vault.
+        vault_b: Arc<FfiVault>,
+        /// The first device's session.
+        session_a: Arc<FfiSyncSession>,
+        /// The second device's session.
+        session_b: Arc<FfiSyncSession>,
+        /// The first device's channel.
+        channel_a: Arc<MemoryChannel>,
+        /// The second device's channel.
+        channel_b: Arc<MemoryChannel>,
+        /// The identifier the two devices share.
+        entry_id: String,
+    }
+
+    impl TwoDevices {
+        /// Registers A, gives B the same master key, and syncs one entry from A to B.
+        fn with_one_shared_entry() -> Self {
+            let (vault_a, store_a) = registered_vault("device-a");
+            let vault_b = vault_of_the_same_account(&store_a);
+            let entry_id = vault_a
+                .add_entry(sample_entry("GitHub"), NOW)
+                .expect("the entry should be added");
+
+            let devices = Self {
+                session_a: FfiSyncSession::open(vault_a.clone()),
+                session_b: FfiSyncSession::open(vault_b.clone()),
+                channel_a: Arc::new(MemoryChannel::new(test_device_id('a'))),
+                channel_b: Arc::new(MemoryChannel::new(test_device_id('b'))),
+                vault_a,
+                vault_b,
+                entry_id,
+            };
+
+            let outcome = devices.sync_a_to_b();
+            assert_eq!(outcome.added, 1, "precondition: B receives the entry");
+            devices.channel_a.clear_outbox();
+            devices
+        }
+
+        /// Sends A's state to B's channel and merges it there.
+        fn sync_a_to_b(&self) -> FfiSyncOutcome {
+            self.session_a
+                .send(
+                    self.channel_a.clone(),
+                    FfiRecipient::All,
+                    FfiPayloadKind::Vault,
+                )
+                .expect("sending should succeed");
+            self.channel_a.deliver_to(&self.channel_b, true);
+            self.session_b
+                .receive(self.channel_b.clone())
+                .expect("receiving should succeed")
+        }
+    }
+
+    /// **The criterion for the whole feature**: two vaults exchange their entries through a
+    /// channel, in one process.
+    ///
+    /// Asserting "no error" would not be enough: a session that sends an empty payload and
+    /// merges nothing reports no error either. What is asserted is that the entry really
+    /// arrives and keeps its identifier, that the way back changes nothing, and that a
+    /// re-delivered payload is refused.
+    #[test]
+    fn two_vaults_complete_a_sync_across_the_boundary() {
+        let (vault_a, store_a) = registered_vault("device-a");
+        let vault_b = vault_of_the_same_account(&store_a);
+        let entry_id = vault_a
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("the entry should be added");
+        assert_eq!(vault_b.entry_count(), 0, "precondition: B starts empty");
+
+        let session_a = FfiSyncSession::open(vault_a.clone());
+        let session_b = FfiSyncSession::open(vault_b.clone());
+        let channel_a = Arc::new(MemoryChannel::new(test_device_id('a')));
+        let channel_b = Arc::new(MemoryChannel::new(test_device_id('b')));
+
+        let plan = session_a
+            .plan_share(channel_a.clone())
+            .expect("planning should succeed");
+        assert!(
+            matches!(plan, FfiSharePlan::FullPayload { len } if len > 0),
+            "a vault with one entry plans as a full payload: {plan:?}"
+        );
+
+        let sync_id = session_a
+            .send(channel_a.clone(), FfiRecipient::All, FfiPayloadKind::Vault)
+            .expect("sending should succeed");
+        assert_eq!(sync_id.len(), 64, "a payload identifier is 32 bytes in hex");
+
+        channel_a.deliver_to(&channel_b, true);
+        let outcome = session_b
+            .receive(channel_b.clone())
+            .expect("receiving should succeed");
+        assert_eq!(outcome.added, 1, "the entry must arrive: {outcome:?}");
+        assert!(
+            !outcome.needs_adjudication,
+            "an ordinary sync asks the user nothing: {outcome:?}"
+        );
+        assert!(!outcome.made_no_change, "something did change: {outcome:?}");
+        assert_eq!(vault_b.entry_count(), 1);
+        let arrived = vault_b.entries();
+        assert_eq!(arrived[0].name, "GitHub");
+        assert_eq!(
+            arrived[0].id, entry_id,
+            "the entry keeps its identifier, which is the only thing the two devices agree on"
+        );
+
+        let replay = session_b
+            .receive(channel_b.clone())
+            .expect_err("nothing is queued any more, so the channel reports no session");
+        assert_eq!(replay.kind(), "sync_no_session_found");
+
+        // Delivering the very same bytes again is a replay, and is refused.
+        channel_a.deliver_to(&channel_b, true);
+        let replay = session_b
+            .receive(channel_b.clone())
+            .expect_err("the same payload must not be applied twice");
+        assert_eq!(replay.kind(), "sync_already_applied");
+
+        session_b
+            .send(channel_b.clone(), FfiRecipient::All, FfiPayloadKind::Vault)
+            .expect("sending back should succeed");
+        channel_b.deliver_to(&channel_a, true);
+        let back = session_a
+            .receive(channel_a.clone())
+            .expect("receiving should succeed");
+        assert!(
+            back.made_no_change,
+            "A already holds everything B has: {back:?}"
+        );
+        assert!(!back.needs_adjudication);
+    }
+
+    /// A payload that claims a different sender than the channel reports is refused.
+    ///
+    /// This is the third-party case: the payload is cryptographically valid, so only the
+    /// channel's own report can tell that somebody else handed it over.
+    #[test]
+    fn a_payload_whose_sender_disagrees_with_the_channel_is_refused() {
+        let devices = TwoDevices::with_one_shared_entry();
+        let mut second_entry = sample_entry("GitLab");
+        second_entry.name = "GitLab".to_owned();
+        devices
+            .vault_a
+            .add_entry(second_entry, NOW + 10)
+            .expect("the entry should be added");
+
+        devices
+            .session_a
+            .send(
+                devices.channel_a.clone(),
+                FfiRecipient::All,
+                FfiPayloadKind::Vault,
+            )
+            .expect("sending should succeed");
+        devices.channel_a.deliver_to(&devices.channel_b, false);
+
+        let error = devices
+            .session_b
+            .receive(devices.channel_b.clone())
+            .expect_err("a misreported sender must be refused");
+        assert_eq!(error.kind(), "sync_sender_mismatch");
+        assert_eq!(
+            devices.vault_b.entry_count(),
+            1,
+            "a refused payload must not modify the vault"
+        );
+    }
+
+    /// A device identifier that is not hexadecimal is refused before anything is sent.
+    #[test]
+    fn an_identifier_that_is_not_hexadecimal_is_refused() {
+        let (vault, _) = registered_vault("device-a");
+        let session = FfiSyncSession::open(vault);
+        let channel = Arc::new(MemoryChannel::new("not a device identifier".to_owned()));
+
+        let error = session
+            .send(channel, FfiRecipient::All, FfiPayloadKind::Vault)
+            .expect_err("the identifier must be rejected");
+        assert_eq!(error.kind(), "invalid_device_id");
+    }
+
+    /// A decision for a conflict that is not waiting is refused rather than applied to
+    /// whatever now sits under that identifier.
+    #[test]
+    fn a_decision_for_a_conflict_that_is_not_waiting_is_refused() {
+        let (vault, _) = registered_vault("device-a");
+        let session = FfiSyncSession::open(vault);
+
+        let error = session
+            .adjudicate("0".repeat(32), FfiDecision::KeepLocal)
+            .expect_err("nothing is waiting for this identifier");
+        assert_eq!(error.kind(), "unknown_conflict");
+    }
+
+    /// A deletion the peer reports about an entry **edited here** is a decision for a human.
+    ///
+    /// The two directions of "one side deleted it" are pinned separately: here the peer
+    /// deleted and this device edited afterwards; the nested test covers the other one.
+    #[test]
+    fn a_peer_deletion_of_an_edited_entry_is_reported_and_closed_by_the_decision() {
+        let devices = TwoDevices::with_one_shared_entry();
+
+        let mut edited = sample_entry("GitHub (work)");
+        edited.id = devices.entry_id.clone();
+        devices
+            .vault_b
+            .update_entry(edited, NOW + 120)
+            .expect("the edit should be accepted");
+        devices
+            .vault_a
+            .remove_entry(devices.entry_id.clone(), NOW + 60)
+            .expect("the deletion should be accepted");
+
+        let outcome = devices.sync_a_to_b();
+        assert!(
+            outcome.needs_adjudication,
+            "a deletion against an edited entry must be reported: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.deletions_applied, 0,
+            "nothing may be deleted before the user decides"
+        );
+        assert_eq!(
+            devices.vault_b.entry_count(),
+            1,
+            "the entry is still there until the decision"
+        );
+        assert_eq!(outcome.conflicts.len(), 1);
+        let conflict = &outcome.conflicts[0];
+        assert_eq!(conflict.kind, "peer_deleted");
+        assert_eq!(conflict.entry_id, devices.entry_id);
+        assert_eq!(
+            conflict
+                .local
+                .as_ref()
+                .expect("the local version is shown")
+                .name,
+            "GitHub (work)"
+        );
+        assert!(
+            conflict.incoming.is_none(),
+            "the peer sent a tombstone, which has nothing to show"
+        );
+        assert!(
+            devices.session_b.pending_conflicts().len() == 1,
+            "the conflict stays available until it is decided"
+        );
+
+        devices
+            .session_b
+            .adjudicate(devices.entry_id.clone(), FfiDecision::TakeIncoming)
+            .expect("the decision should apply");
+        assert_eq!(devices.vault_b.entry_count(), 0, "the deletion is applied");
+        assert_eq!(devices.vault_b.tombstone_count(), 1);
+        assert!(
+            devices.session_b.pending_conflicts().is_empty(),
+            "a decided conflict stops being pending"
+        );
+
+        devices.channel_a.clear_outbox();
+        let settled = devices.sync_a_to_b();
+        assert!(
+            !settled.needs_adjudication,
+            "the decision must close the conflict: {settled:?}"
+        );
+    }
+
+    /// An entry deleted **here** that the peer still holds can be kept deleted.
+    #[test]
+    fn a_local_deletion_can_be_confirmed_against_a_peer_that_still_has_the_entry() {
+        let devices = TwoDevices::with_one_shared_entry();
+        devices
+            .vault_b
+            .remove_entry(devices.entry_id.clone(), NOW + 60)
+            .expect("the deletion should be accepted");
+
+        let outcome = devices.sync_a_to_b();
+        assert!(outcome.needs_adjudication, "{outcome:?}");
+        let conflict = &outcome.conflicts[0];
+        assert_eq!(conflict.kind, "local_deleted");
+        assert!(
+            conflict.local.is_none(),
+            "this device holds only a tombstone, so there is no local version to show"
+        );
+        assert_eq!(
+            conflict
+                .incoming
+                .as_ref()
+                .expect("the peer's version is shown")
+                .name,
+            "GitHub"
+        );
+
+        devices
+            .session_b
+            .adjudicate(devices.entry_id.clone(), FfiDecision::KeepLocal)
+            .expect("the decision should apply");
+        assert_eq!(devices.vault_b.entry_count(), 0, "the entry stays deleted");
+        assert!(
+            devices.vault_b.tombstone_count() == 1,
+            "the deletion is still recorded, so it keeps travelling"
+        );
+    }
+
+    /// The same conflict, decided the other way: the entry comes back.
+    ///
+    /// This is the case that needs the tombstone to be dropped: keeping it next to a live
+    /// entry would let the payload builder send the tombstone on its own, and the peer would
+    /// delete the entry again.
+    #[test]
+    fn an_entry_deleted_here_can_be_restored_from_the_peer() {
+        let devices = TwoDevices::with_one_shared_entry();
+        devices
+            .vault_b
+            .remove_entry(devices.entry_id.clone(), NOW + 60)
+            .expect("the deletion should be accepted");
+
+        let outcome = devices.sync_a_to_b();
+        assert_eq!(outcome.conflicts[0].kind, "local_deleted");
+        devices
+            .session_b
+            .adjudicate(devices.entry_id.clone(), FfiDecision::TakeIncoming)
+            .expect("the decision should apply");
+
+        assert_eq!(devices.vault_b.entry_count(), 1, "the entry is back");
+        assert_eq!(
+            devices.vault_b.tombstone_count(),
+            0,
+            "the tombstone must be gone, or the peer would delete the entry again"
+        );
+        assert_eq!(
+            devices
+                .vault_b
+                .entry(devices.entry_id.clone())
+                .expect("the entry is readable")
+                .name,
+            "GitHub"
+        );
+
+        devices.channel_a.clear_outbox();
+        let settled = devices.sync_a_to_b();
+        assert!(
+            !settled.needs_adjudication,
+            "the decision must close the conflict: {settled:?}"
+        );
+        assert!(settled.made_no_change, "both sides now hold the same entry");
+    }
+
+    /// A payload that authenticates but is not a payload at all is refused without touching
+    /// the vault, and the error says which layer rejected it.
+    #[test]
+    fn a_garbage_payload_is_refused_across_the_boundary() {
+        let devices = TwoDevices::with_one_shared_entry();
+        devices
+            .channel_b
+            .inject(test_device_id('a'), vec![0_u8; 200]);
+
+        let error = devices
+            .session_b
+            .receive(devices.channel_b.clone())
+            .expect_err("random bytes are not a payload");
+        assert_eq!(
+            error.kind(),
+            "sync_bad_magic",
+            "the header is checked before anything is decrypted"
+        );
+        assert_eq!(devices.vault_b.entry_count(), 1, "the vault is untouched");
     }
 }

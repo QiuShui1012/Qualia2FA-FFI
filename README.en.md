@@ -191,6 +191,73 @@ responder.confirm(vault, verifier.sessionId()!!, verifier.confirmation()!!)  // 
 > The exception is an **old version 1 file**: that file really carries nothing to decide
 > with, so use challenge-response when authoritative confirmation is needed.
 
+### Synchronization (`FfiSyncSession`)
+
+Syncing is **two devices, one code each, one direction at a time**: one shows its state, the
+other reads it and merges it, and then it is the other way round. The payload is encrypted and
+authenticated by the core; the channel only moves bytes.
+
+**The channel is implemented by the host side** (`FfiTransport`): today the text/QR code
+channel, later a LAN channel in the same place.
+
+```kotlin
+// The channel: an outbound queue and an inbound queue, with no decisions of its own
+class CodeChannel(private val me: String) : FfiTransport { /* … */ }
+
+val session = FfiSyncSession.open(vault)
+
+// Show this device's state
+session.send(channel, FfiRecipient.All, FfiPayloadKind.Vault)
+showQrCode(channel.takeOutgoing())
+
+// Read the other device's code and merge it
+channel.accept(senderId, payloadBytes)
+val outcome = session.receive(channel)
+if (outcome.needsAdjudication) {
+    for (conflict in session.pendingConflicts()) {
+        showConflict(conflict)
+    }
+    session.adjudicate(conflict.entryId, FfiDecision.TakeIncoming)
+}
+vault.serialize()?.let(::saveVault)     // the merge wrote into the vault: persist it
+```
+
+| Member | Meaning |
+|---|---|
+| `FfiSyncSession.open(vault)` | Opens a session on an unlocked vault |
+| `send(transport, to, kind)` → `syncId` | Seals and sends (`Vault` = this device's whole state, `Request` = "send me yours") |
+| `receive(transport)` → `FfiSyncOutcome` | Takes one message and merges it; on failure neither the vault nor the replay log changes |
+| `pendingConflicts()` | The conflicts still waiting, in the order the merge reported them |
+| `adjudicate(entryId, decision)` | Decides one, **by identifier rather than by position** (positions shift once one is decided) |
+| `planShare(transport)` | Answers "does it fit" only: it sends nothing and displays nothing |
+| `FfiPlatformKeys.deviceId()` | This device's identifier, which the channel has to report truthfully |
+
+An `FfiTransport` implementation owes the same contract as the core's `Transport`: **report
+the sender truthfully** (the core checks it against the authenticated field inside the
+payload), respect `FfiRecipient.One`, return `null` rather than block when there is nothing
+to receive, and report `transport_already_used` when a one-shot channel is used twice. Device
+identifiers are always **64 hexadecimal characters**.
+
+A conflict's `kind` is a stable string, and the host side needs a fallback branch for values
+it does not know:
+
+| kind | Meaning | The two choices |
+|---|---|---|
+| `entry_mismatch` | Both sides hold the entry with different content | keep this device's version / take the other one |
+| `peer_deleted` | The other device deleted it; this one edited it and still has it | keep the entry / accept the deletion |
+| `local_deleted` | This device deleted it; the other one still has it | keep it deleted / restore the entry |
+
+> **A decision applies to this device only.** "Take the other version" really writes into the
+> vault, so it **must be persisted**; "keep this device's version" does not make the
+> disagreement go away — the other device still holds its version and will ask its own user in
+> turn. The two sides converge only once both have chosen.
+
+> **The replay log is not persisted.** Within one run the same payload is never applied
+> twice; after a restart the log is empty and the same payload can be merged again — merging
+> is idempotent, so the result is the same. The code channel is out-of-band and one-shot,
+> which is why that boundary is acceptable; a LAN channel that needs it across restarts will
+> be the point at which it is exposed.
+
 ## Error handling
 
 Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
@@ -199,6 +266,9 @@ Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
 |---|---|
 | `InputTooLong` | The input exceeds the boundary limit |
 | `Core` | An error returned by the core, structured as `FfiCoreError { kind, message }` |
+| `Qr` | A failure reported by the channel itself (`kind` + `detail`), such as an image with no code in it |
+| `InvalidDeviceId` | A device identifier passed in is not 64 hexadecimal characters |
+| `UnknownConflict` | A decision was made for a conflict that is not waiting: a decision belongs to the merge that produced it |
 
 `kind` is a **stable machine-readable identifier** (such as `secret_empty`,
 `vault_entry_not_found`) that the host side dispatches its UI on; `message` is for display
@@ -214,6 +284,8 @@ user-visible errors:
 | `vault_entry_not_found` | "the vault is empty" | An empty list is shown while the user was just looking at an entry |
 | `recovery_authentication_failed` | `recovery_file_malformed` | The user retries the passphrase over and over when the passphrase is not the problem |
 | `pairing_authentication_failed` | any more specific error | Gives an attacker an "almost succeeded" oracle |
+| `sync_already_applied` | `sync_authentication_failed` | "Already merged" is reported as "this code is fake", and the user regenerates a code that was fine |
+| `sync_sender_mismatch` | `sync_authentication_failed` | "The sender does not match" is reported as "wrong key", which sends the investigation the wrong way |
 
 `pairing_authentication_failed` covers many causes — altered ciphertext, a session that
 does not match, a reply coming from a different login — and **that is deliberate**.
