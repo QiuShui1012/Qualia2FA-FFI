@@ -1,37 +1,46 @@
-//! Qualia2FA 的 FFI 层：把 `qualia2fa-core` 暴露为 UniFFI 绑定。
+//! FFI layer of Qualia2FA: exposes `qualia2fa-core` as UniFFI bindings.
 //!
-//! # 本 crate 的职责边界
+//! # Responsibility of this crate
 //!
-//! 这里**只做搬运**：把 Kotlin/Swift 传进来的原始类型转成核心类型、调用核心、
-//! 把结果转回去。**任何加密、解析、校验逻辑出现在本文件里都是设计倒退**——
-//! 那些必须留在 `qualia2fa-core` 内，因为只有核心是无 unsafe、可独立审计的。
+//! This crate **only moves data**: it converts the primitive types passed in from
+//! Kotlin/Swift into core types, calls the core, and converts the results back.
+//! **Any cryptography, parsing or validation logic in this file is a design
+//! regression** — such logic must stay inside `qualia2fa-core`, the only layer
+//! that is free of unsafe code and can be audited on its own.
 //!
-//! 审查本仓库时的检查项就一条：**有没有把核心的逻辑搬到这里来**。
+//! A review of this crate has a single checklist item: **has any core logic been
+//! moved in here?**
 //!
-//! # 为什么不能 `#![forbid(unsafe_code)]`
+//! # Why `#![forbid(unsafe_code)]` is not possible
 //!
-//! `uniffi::setup_scaffolding!()` 在本 crate 内展开 FFI 边界所需的 unsafe 代码
-//! （裸指针解引用、`catch_unwind`、字符串所有权转移）。FFI 边界本身就是 unsafe 的。
+//! `uniffi::setup_scaffolding!()` expands the unsafe code the FFI boundary needs
+//! inside this crate (raw pointer dereferences, `catch_unwind`, transfer of string
+//! ownership). The FFI boundary itself is unsafe.
 //!
-//! 安全边界因此划在 **crate 之间**：核心 `forbid(unsafe_code)`，本 crate 是唯一
-//! 允许 unsafe 的地方，且必须是薄的。`Cargo.toml` 里把 `unsafe_code` 设为 `warn`
-//! 而非 `allow`，是为了让任何新增的 unsafe 在构建时发出声音。
+//! The safety boundary therefore runs **between crates**: the core is
+//! `forbid(unsafe_code)`, and this crate is the only place allowed to contain
+//! unsafe code, which must stay thin. `Cargo.toml` sets `unsafe_code` to `warn`
+//! rather than `allow` so that any new unsafe code is reported at build time.
 //!
-//! # 秘密材料的处理约定
+//! # Handling of secret material
 //!
-//! 核心的 [`OtpSecret`] **刻意不实现 `Clone`、不暴露裸字节**，且其 `Debug` 连
-//! 长度都不打印。跨 FFI 边界时统一以 **Base32 字符串**作为种子的表示形式：
+//! The core's [`OtpSecret`] **deliberately implements neither `Clone` nor a raw
+//! byte accessor**, and its `Debug` does not even print the length. Across the FFI
+//! boundary a seed is always represented as a **Base32 string**:
 //!
-//! - 传入：`&str` → [`OtpSecret::from_base32`]
-//! - 传出：[`OtpSecret::to_base32`]
+//! - inbound: `&str` -> [`OtpSecret::from_base32`]
+//! - outbound: [`OtpSecret::to_base32`]
 //!
-//! 于是种子的字节永远不会以 `Vec<u8>` 形式经过 FFI（那会在两侧各留一份不受
-//! 擦除控制的拷贝）。Base32 是核心已选定的「唯一窄出口」，这里沿用同一决定。
+//! Seed bytes therefore never cross the FFI boundary as a `Vec<u8>`, which would
+//! leave one copy on each side outside the control of any erasure. Base32 is the
+//! single narrow exit already chosen by the core, and this layer reuses it.
 //!
-//! ⚠️ **已知残留风险**：Base32 字符串在 Kotlin/Swift 侧是普通 `String`，
-//! 不受 `secrecy` 的擦除保护，且可能被 GC 复制、进字符串常量池。这是托管语言的
-//! 固有限制，**端侧必须自行约定**：种子的 Base32 只在必要作用域内存在，用完立即
-//! 丢弃，绝不写入日志或持久化。见 TODO.md 的端侧安全约定。
+//! **Known residual risk**: on the Kotlin/Swift side a Base32 string is an
+//! ordinary `String`, not protected by `secrecy`'s erasure, and it may be copied
+//! by the garbage collector or stored in a string pool. That is an inherent
+//! limitation of managed languages, so **the client side must adopt its own
+//! discipline**: a seed's Base32 exists only in the scope that needs it, is
+//! dropped immediately afterwards, and is never logged or persisted.
 
 uniffi::setup_scaffolding!();
 
@@ -46,105 +55,147 @@ use qualia2fa_core::uri;
 use qualia2fa_core::vault::{Entry, MasterKey, VaultFile};
 use qualia2fa_core::{Error, ExposeSecret as _, SecretString};
 
-/// 挑战-应答的会话标识长度。
+/// Length of a challenge-response session identifier.
 ///
-/// 核心的 `auth::SESSION_ID_LEN` 是**私有**常量（它属于协议内部，不该被上层依赖），
-/// 因此这里按协议长度写死。这个数字不是随手取的：核心 `pairing::SESSION_ID_LEN`
-/// 同样是 32，两处一致是有意的——同一条信道上的会话标识必须等长，否则上层做
-/// 会话比较时会出现「长度不同所以必然不等」的假阴性。
+/// The core's `auth::SESSION_ID_LEN` is a **private** constant (it belongs to the
+/// protocol internals and is not meant to be depended on from above), so the
+/// value is written out here. It is not arbitrary: the core's
+/// `pairing::SESSION_ID_LEN` is 32 as well, and the two are equal on purpose —
+/// session identifiers on one channel must have the same length, otherwise a
+/// length comparison would report a difference where there is none.
 const AUTH_SESSION_ID_LEN: usize = 32;
 
-/// 挑战-应答的确认标签长度（核心 `auth::CONFIRM_LEN`，同为私有）。
+/// Length of a challenge-response confirmation tag (core `auth::CONFIRM_LEN`, also private).
 const AUTH_CONFIRM_LEN: usize = 32;
 
-/// 跨 FFI 边界传入的种子字符串的长度上限（字符数）。
+/// Maximum length in characters of a seed string crossing the FFI boundary.
 ///
-/// 真实种子是 16–64 字节（Base32 约 26–104 字符）。这里给到 2048，留足非标准
-/// 场景的余量，同时挡掉「端侧被诱导传入一个巨大字符串」这类无意义输入。
+/// Real seeds are 16-64 bytes (about 26-104 Base32 characters). The limit is 2048,
+/// which leaves room for non-standard cases while rejecting meaningless input such
+/// as a huge string a client was tricked into passing in.
 ///
-/// **这是防御性上限，不是规范要求**：核心刻意不对种子长度设下限（真实世界存在
-/// 短种子），「长度是否达标」的判断属于 UI 层的告警，见
-/// [`is_secret_shorter_than_recommended`]。
+/// **This is a defensive limit, not a specification requirement**: the core
+/// deliberately sets no lower bound on seed length (short seeds exist in the
+/// wild), and judging whether a length is adequate is a UI-layer warning, see
+/// [`is_secret_shorter_than_recommended`].
 const MAX_SECRET_CHARS: usize = 2048;
 
-/// 跨 FFI 边界传入的 `otpauth://` URI 的长度上限（字符数）。
+/// Maximum length in characters of an `otpauth://` URI crossing the FFI boundary.
 ///
-/// 真实 URI 通常不到 200 字符。二维码容量上限约 2953 字节，故 4096 足以容纳
-/// 任何来自二维码的 URI，同时挡住超大输入。
+/// Real URIs are usually shorter than 200 characters. A QR code holds at most
+/// about 2953 bytes, so 4096 covers any URI that can arrive from a QR code while
+/// rejecting oversized input.
 const MAX_URI_CHARS: usize = 4096;
 
-/// 跨 FFI 边界传入的保险库字段长度上限（字符数）。
+/// Maximum length in characters of a vault field crossing the FFI boundary.
 ///
-/// 核心对解密后的字段有自己的上限（`Entry::MAX_FIELD_LEN`，64 KiB 字节），但那是
-/// **解密后**的防线。这里挡的是从端侧进来的一侧：界面上的文本框不该有理由塞进
-/// 比这更长的内容，在边界上拒绝比让它走完一次加密再在核心报错更省事，也避免
-/// 「用户输入了几 MB」这种情况进入加密路径。
+/// The core enforces its own limit on decrypted fields (`Entry::MAX_FIELD_LEN`,
+/// 64 KiB bytes), but that is the **post-decryption** defence. This constant
+/// guards the side coming in from the client: a UI text box has no reason to hold
+/// more than this, and rejecting at the boundary is cheaper than running a whole
+/// encryption pass only to fail inside the core.
 ///
-/// 取 8 KiB 字符（而非核心的 64 KiB 字节）：按字符计是因为端侧传来的是字符串，
-/// 按字节计会让含中文的备注更容易触发上限，行为不好解释。8 KiB 字符已经远超任何
-/// 真实的服务名/账号名/备注。
+/// The limit counts characters (8 Ki characters) rather than the core's 64 KiB
+/// bytes because what the client sends is a string; counting bytes would make a
+/// note containing non-ASCII text hit the limit much earlier. 8 Ki characters is
+/// far beyond any real service name, account name or note.
 const MAX_VAULT_FIELD_CHARS: usize = 8 * 1024;
 
-/// 跨 FFI 边界传入的设备标签长度上限（字符数）。
+/// Maximum length in characters of a device label crossing the FFI boundary.
 ///
-/// 标签会进入平台密钥库，而各平台对密钥名的长度限制不同（Windows CNG、Android
-/// Keystore、iOS 的 keychain 都有限制，且不都公开）。真实标签是 `qualia2fa-device`
-/// 这类短串，256 字符足够，同时挡住「端侧被诱导传入一个巨大的标签」。
+/// The label ends up in the platform key store, and platforms differ in how long a
+/// key name may be (Windows CNG, Android Keystore and the iOS keychain all impose
+/// limits, and not all of them are documented). Real labels are short strings such
+/// as `qualia2fa-device`, so 256 characters is ample while still rejecting an
+/// oversized label passed in by a client.
 const MAX_LABEL_CHARS: usize = 256;
 
-/// 跨 FFI 边界传入的口令长度上限（字符数）。
+/// Maximum length in characters of a passphrase crossing the FFI boundary.
 ///
-/// 口令会进入 Argon2，而 Argon2 的处理时间随输入长度线性增长。没有上限时，一个
-/// 几 MB 的「口令」能让导出/导入长时间占住线程。真实口令远短于此——**限制长度
-/// 不是安全措施**（口令的强度来自熵而不是长度），只是拒绝无意义输入。
+/// The passphrase is fed to Argon2, whose running time grows linearly with the
+/// input length. Without a limit, a multi-megabyte "passphrase" could occupy the
+/// thread for a long time during export or import. **The limit is not a security
+/// measure** (passphrase strength comes from entropy, not length); it only
+/// rejects meaningless input.
 const MAX_PASSPHRASE_CHARS: usize = 1024;
 
-/// 跨 FFI 边界传入的二维码文本长度上限（字符数）。
+/// Maximum length in characters of QR code text crossing the FFI boundary.
 ///
-/// 二维码载荷是 99 字节，Base32 后 159 个字符。给到 512 留出端侧可能带的前后缀
-/// （例如用户从聊天记录里连引号一起复制过来）的余量，同时挡住超大输入。
+/// The QR payload is 99 bytes, 159 characters in Base32. The limit is 512, which
+/// leaves room for text the client may carry around the payload (for example a
+/// user copying the code together with quotes from a chat log) while rejecting
+/// oversized input.
 const MAX_QR_TEXT_CHARS: usize = 512;
 
-/// 核心错误的摘要，用于跨 FFI 边界传递。
+/// Summary of a core error, carried across the FFI boundary.
 ///
-/// # 为什么需要这一层，而不是直接把核心 `Error` 放进去
+/// # Why this layer exists instead of the core `Error` itself
 ///
-/// UniFFI 要求错误枚举的每个字段都实现 `Lift`/`Lower`/`TypeId`。核心的
-/// [`Error`] 是一个 `#[non_exhaustive]` 的富错误枚举（含 `String`、`usize`
-/// 等载荷），它并不是一个 UniFFI 类型——除非把它整个标注为
-/// `#[uniffi::Error]`，而那会把核心与绑定生成器重新耦合在一起，
-/// 正是本项目要避免的（见 TODO.md §4.4）。
+/// UniFFI requires every field of an error enum to implement `Lift`/`Lower`/
+/// `TypeId`. The core's [`Error`] is a `#[non_exhaustive]` rich error enum
+/// (carrying `String`, `usize` and other payloads) and is not a UniFFI type;
+/// marking it as `#[uniffi::Error]` would couple the core to the binding
+/// generator again.
 ///
-/// 另一种做法是给错误枚举加 `#[uniffi(flat_error)]`，让所有变体只以
-/// `Display` 文本跨边界。那样端侧只剩一个不透明的字符串，**无法按失败原因
-/// 分流 UI**（「种子输入错误」要提示用户重输，「周期为 0」是程序缺陷，
-/// 「随机源不可用」要提示重试——三者对用户的意义完全不同）。
+/// With `#[uniffi(flat_error)]` the variants would cross the boundary as `Display`
+/// text only, leaving the client with one opaque string and **no way to dispatch
+/// the UI by failure reason** (a bad seed asks the user to retype, a zero period is
+/// a program defect, unavailable randomness asks for a retry — three very different
+/// meanings for the user).
 ///
-/// 因此这里显式拆出两个字段：
+/// This type therefore carries two fields:
 ///
-/// - `kind`：稳定的机器可读标识，端侧用它分支
-/// - `message`：面向用户的文本，仅用于展示与日志
+/// - `kind`: a stable machine-readable identifier the client branches on
+/// - `message`: user-facing text, for display and logs only
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiCoreError {
-    /// 稳定的错误标识，见 [`core_error_kind`] 的约定。
+    /// Stable error identifier; see the contract in [`core_error_kind`].
     pub kind: String,
-    /// 面向人的错误文本（与核心 `Display` 一致）。
+    /// Human-readable error text (identical to the core's `Display`).
     pub message: String,
 }
 
-/// 把核心错误映射为**稳定的**机器可读标识。
+/// Maps a core error to a **stable** machine-readable identifier.
 ///
-/// # 稳定性契约
+/// # Stability contract
 ///
-/// 这些字符串是端侧 `switch` 的依据，因此**属于公开接口**：可以新增，
-/// 但既有值不得改名或改变含义（改名等同于破坏端侧行为）。
+/// These strings are what the client `switch`es on, so they are **part of the
+/// public interface**: new values may be added, but existing values must not be
+/// renamed or change meaning (a rename breaks client behaviour).
 ///
-/// 端侧必须对未知 `kind` 有兜底分支——核心是 `#[non_exhaustive]` 的，
-/// 未来会新增变体，旧端侧会遇到没见过的值。
+/// The client must have a fallback branch for unknown `kind` values: the core is
+/// `#[non_exhaustive]`, so variants will be added and older clients will meet
+/// values they have never seen.
 ///
-/// 这里刻意**不用** `format!("{source:?}")` 或变体名的自动派生：Debug 输出
-/// 是实现细节，重命名变体会静默改变端侧行为，且 `Debug` 里可能带载荷内容。
-/// 逐个 `match` 写死字符串，是为了让「改了名字」在代码审查时显式可见。
+/// `format!("{source:?}")` and automatic derivation from the variant name are
+/// deliberately not used: `Debug` output is an implementation detail, renaming a
+/// variant would silently change client behaviour, and it may contain payload
+/// contents. Every string is written out in an explicit `match` arm so that a
+/// rename is visible during review.
+///
+/// # Notes on individual kinds
+///
+/// - `vault_entry_not_found` is distinct from an empty vault: the entry the caller
+///   is acting on no longer exists.
+/// - `vault_bad_key_check` reports a structural problem (the key check value has
+///   the wrong length, or the file is truncated or malformed), whereas
+///   `vault_decryption_failed` reports a wrong key or a file that was modified.
+/// - `device_not_registered` means this device has never been registered;
+///   `vault_decryption_failed` means it was registered but the data cannot be
+///   decrypted.
+/// - `pairing_authentication_failed` deliberately does not distinguish a modified
+///   ciphertext, a wrong session and a wrong joiner public key, so that an attacker
+///   gets no oracle for "almost succeeded".
+/// - Failures reported by the device identity library are split into
+///   `device_public_key_invalid`, `device_signature_invalid` and `device_error`
+///   rather than one generic kind.
+/// - The final `_ => "unknown"` arm is **required**: the core's `Error` is
+///   `#[non_exhaustive]`, so a wildcard arm is mandatory outside its own crate
+///   (removing it is `E0004`). The price is that the compiler does not flag a newly
+///   added core variant — `"unknown"` silently absorbs it and the client receives a
+///   kind it cannot dispatch. The `every_mapped_error_kind_is_distinct_and_known`
+///   test guards against that instead of the compiler: add one mapping arm per new
+///   variant and add the value to that test's list.
 #[must_use]
 pub fn core_error_kind(source: &Error) -> &'static str {
     match source {
@@ -168,7 +219,7 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::UriInvalidPercentEncoding => "uri_invalid_percent_encoding",
         Error::UriIssuerMismatch { .. } => "uri_issuer_mismatch",
         Error::UriAccountContainsColon { .. } => "uri_account_contains_colon",
-        // ── M2：保险库 ────────────────────────────────────────────────────
+        // ── Vault ──────────────────────────────────────────────────────────
         Error::VaultTruncated => "vault_truncated",
         Error::VaultBadMagic => "vault_bad_magic",
         Error::VaultUnsupportedVersion { .. } => "vault_unsupported_version",
@@ -178,28 +229,18 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::VaultTooManyRecords => "vault_too_many_records",
         Error::VaultTrailingBytes { .. } => "vault_trailing_bytes",
         Error::VaultDuplicateEntryId => "vault_duplicate_entry_id",
-        // 与「保险库为空」严格区分：界面在「列表是空的，引导添加第一条」与「你正在
-        // 操作的那一条已经不在了，刷新列表」之间的动作完全不同。合并两者会让界面
-        // 显示一个空列表，而用户刚才明明还在看条目。
         Error::VaultEntryNotFound => "vault_entry_not_found",
         Error::VaultDuplicateField { .. } => "vault_duplicate_field",
         Error::VaultCorrupt => "vault_corrupt",
-        // 与 `vault_decryption_failed` 严格区分：**这个是结构问题（检查值长度不对，
-        // 文件被截断或构造坏了），那个是密钥不对或文件被改过**。合并两者会让「文件
-        // 不可信」被误报成「你的密钥错了」，用户于是去比对密钥，而问题不在那里。
         Error::VaultBadKeyCheck => "vault_bad_key_check",
         Error::VaultInvalidUtf8 => "vault_invalid_utf8",
-        // 端侧最需要单独分流的一个：主密钥与文件不匹配。
         Error::VaultDecryptionFailed => "vault_decryption_failed",
         Error::MasterKeyWrongLength { .. } => "master_key_wrong_length",
         Error::FieldTooLong { .. } => "field_too_long",
         Error::VaultIo { .. } => "vault_io",
-        // ── M3：设备身份、配对、恢复、挑战-应答 ──────────────────────────
+        // ── Device identity, pairing, recovery, challenge-response ─────────
         Error::DevicePublicKeyInvalid { .. } => "device_public_key_invalid",
         Error::DeviceSignatureInvalid { .. } => "device_signature_invalid",
-        // 设备身份库自己报出的失败。分成三个 kind 而不是一个笼统的 "device_error"：
-        // 端侧对它们的处置不同——公钥不合法要重新扫码，验签不通过是安全事件，而
-        // 「本机没有硬件密钥库」要引导用户换机器或接受软件密钥。
         Error::Device(qualia_dik::Error::DevicePublicKeyInvalid { .. }) => {
             "device_public_key_invalid"
         }
@@ -209,9 +250,6 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::Device(_) => "device_error",
         Error::PairingPayloadMalformed { .. } => "pairing_payload_malformed",
         Error::PairingUnsupportedVersion { .. } => "pairing_unsupported_version",
-        // 配对失败的原因**刻意不细分**（密文被改、会话不对、加入方公钥不对都归这里），
-        // 免得给攻击者一个区分「差一点就成功」的预言机。端侧的文案也应当保持笼统：
-        // 「配对失败，请重新扫码」而不是「密钥错误」。
         Error::PairingAuthenticationFailed => "pairing_authentication_failed",
         Error::RecoveryFileMalformed { .. } => "recovery_file_malformed",
         Error::RecoveryParametersInvalid { .. } => "recovery_parameters_invalid",
@@ -223,35 +261,27 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::AuthMessageMalformed { .. } => "auth_message_malformed",
         Error::AuthProofFailed => "auth_proof_failed",
         Error::DeviceKeyMissing => "device_key_missing",
-        // 与 `vault_decryption_failed` 严格区分：这个表示「这台设备从来没登录过」，
-        // 界面应当引导注册/登录；那个表示「登录过但数据解不开」，界面必须警告数据
-        // 可能已丢失。合并两者会让用户在被引导重新注册时永久失去原有条目。
         Error::DeviceNotRegistered => "device_not_registered",
         Error::DeviceIdentityMismatch => "device_identity_mismatch",
         Error::SecureStoreWriteFailed { .. } => "secure_store_write_failed",
         Error::TimestampZero => "timestamp_zero",
-        // 兜底分支是**必需**的：核心的 `Error` 标了 `#[non_exhaustive]`，因此它
-        // 自己的 crate 之外必须有一个通配分支（去掉这里会报 E0004）。
-        //
-        // 代价是**新增核心变体时编译器不会提醒**——`"unknown"` 会悄悄兜住它，端侧
-        // 收到一个无法分派的 kind。防这个的是一条测试（
-        // `every_mapped_error_kind_is_distinct_and_known`），不是编译器：给每个新
-        // 变体加一行映射、并把它加进那条测试的列表。
         _ => "unknown",
     }
 }
 
 impl FfiError {
-    /// 稳定的错误标识，供端侧分派界面文案。
+    /// Stable error identifier, for the client to dispatch UI text on.
     ///
-    /// 端侧本可以直接读 `FfiError.Core.detail.kind`，但那要求每个调用点都先判断
-    /// 是哪个变体。这个方法把「边界自身的错误」也纳入同一套标识
-    /// （`input_too_long`），于是端侧只需要一个 `when`。
+    /// The client could read `FfiError.Core.detail.kind` directly, but that would
+    /// require every call site to match on the variant first. This method folds the
+    /// boundary's own errors into the same set of identifiers (`input_too_long`),
+    /// so the client needs a single `when`.
     ///
-    /// # 为什么是稳定契约
+    /// # Why this is a stable contract
     ///
-    /// 这些字符串是**接口的一部分**：端侧的文案分支按它们分派。改名等于破坏兼容，
-    /// 因此只能新增，不能改已有值。
+    /// These strings are **part of the interface**: the client dispatches its text
+    /// branches on them. Renaming breaks compatibility, so values may only be
+    /// added.
     #[must_use]
     pub fn kind(&self) -> &str {
         match self {
@@ -270,57 +300,62 @@ impl From<Error> for FfiCoreError {
     }
 }
 
-/// 让 [`FfiCoreError`] 能以 `Display` 形式参与外层错误的文案。
+/// Lets [`FfiCoreError`] take part in an outer error's text through `Display`.
 ///
-/// 手写而非 derive：`Display` 输出的就是 `message`，不再重复拼 `kind`——
-/// `kind` 是给程序看的，把它塞进面向用户的文本只会增加噪音。
+/// Written by hand rather than derived: `Display` outputs `message` and does not
+/// repeat `kind` — `kind` is meant for programs, and putting it into user-facing
+/// text only adds noise.
 ///
-/// 之所以需要它：`#[error("{source}")]` 要求 `source` 实现 `Display`，
-/// 否则 thiserror 会转而把它当作 `Error::source()` 处理并报
-/// 「`as_dyn_error` 的 trait 约束未满足」。
+/// It is needed because `#[error("{source}")]` requires `source` to implement
+/// `Display`; otherwise thiserror treats it as `Error::source()` instead and
+/// reports an unsatisfied `as_dyn_error` trait bound.
 impl core::fmt::Display for FfiCoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-/// FFI 边界自身的错误。
+/// Errors originating in the FFI boundary itself.
 ///
-/// 与核心的 [`Error`] 分开，因为「输入超长」是**边界**的问题，不是核心的语义。
-/// 核心错误经 [`FfiCoreError`] 结构化透传，不等同于丢弃分类。
+/// Kept separate from the core's [`Error`] because "input too long" is a
+/// **boundary** concern, not a core semantic. Core errors are passed through in
+/// structured form as [`FfiCoreError`], which is not the same as discarding their
+/// classification.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
-    /// 输入超过本层设定的上限。
+    /// The input exceeds the limit set by this layer.
     #[error("输入过长：{kind} 上限为 {limit} 字符，实际 {actual} 字符")]
     InputTooLong {
-        /// 被限制的输入类别（`secret` / `uri`）。
+        /// The restricted input category (`secret` / `uri`).
         kind: String,
-        /// 允许的最大字符数。
+        /// Maximum number of characters allowed.
         limit: u64,
-        /// 实际字符数。
+        /// Actual number of characters.
         actual: u64,
     },
 
-    /// 核心返回的错误。
+    /// An error returned by the core.
     ///
-    /// **不加 `#[from]`**：`#[from]` 会让 thiserror 生成
-    /// `impl From<Error> for FfiError`，但 UniFFI 要求每个字段都是可跨边界的
-    /// 类型，而核心 `Error` 不是。转换由手写 `From` 完成，经 [`FfiCoreError`]
-    /// 结构化为纯数据后再跨边界。
+    /// **No `#[from]`**: `#[from]` would make thiserror generate
+    /// `impl From<Error> for FfiError`, but UniFFI requires every field to be a
+    /// type that can cross the boundary, and the core `Error` is not. The
+    /// conversion is a hand-written `From` that first reduces the error to the
+    /// plain data of [`FfiCoreError`].
     ///
-    /// 字段名刻意用 `detail` 而非 `source`：thiserror 把名为 `source` 的字段
-    /// 一律当作 `Error::source()` 处理（要求实现 `std::error::Error`），
-    /// 即使文案里只写 `{source}` 也一样，会报 `as_dyn_error` 约束不满足。
+    /// The field is named `detail` rather than `source` on purpose: thiserror
+    /// always treats a field named `source` as `Error::source()` (requiring
+    /// `std::error::Error`), even when the text only writes `{source}`, and then
+    /// reports an unsatisfied `as_dyn_error` bound.
     #[error("{detail}")]
     Core {
-        /// 核心错误的结构化摘要。
+        /// Structured summary of the core error.
         detail: FfiCoreError,
     },
 }
 
-/// 核心错误 → FFI 错误的转换。
+/// Conversion from a core error to an FFI error.
 ///
-/// 手写而非用 `#[from]`，原因见 [`FfiError::Core`] 的说明。
+/// Hand-written rather than `#[from]`; see [`FfiError::Core`].
 impl From<Error> for FfiError {
     fn from(source: Error) -> Self {
         FfiError::Core {
@@ -329,19 +364,19 @@ impl From<Error> for FfiError {
     }
 }
 
-/// 从 FFI 传入的哈希算法选择。
+/// Hash algorithm selection passed in over FFI.
 ///
-/// 不直接暴露核心的 [`Algorithm`]，原因有二：
+/// The core's [`Algorithm`] is not exposed directly, for two reasons:
 ///
-/// 1. 中间隔一层，端侧枚举命名变化不会影响 Rust 侧 API。
-/// 2. 未来核心若改为携带数据的枚举，FFI 契约不受影响。
+/// 1. The extra layer keeps the Rust API unaffected by renames of the client-side enum.
+/// 2. If the core ever turns it into an enum carrying data, the FFI contract stays unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiAlgorithm {
-    /// HMAC-SHA-1（RFC 6238 默认；几乎所有真实服务端都只支持它）。
+    /// HMAC-SHA-1 (the RFC 6238 default; almost every real server supports only this).
     Sha1,
-    /// HMAC-SHA-256。
+    /// HMAC-SHA-256.
     Sha256,
-    /// HMAC-SHA-512。
+    /// HMAC-SHA-512.
     Sha512,
 }
 
@@ -355,14 +390,14 @@ impl From<FfiAlgorithm> for Algorithm {
     }
 }
 
-/// 验证码位数。
+/// Number of digits in a generated code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiDigits {
-    /// 6 位（默认）。
+    /// 6 digits (the default).
     Six,
-    /// 7 位（部分银行使用）。
+    /// 7 digits (used by some banks).
     Seven,
-    /// 8 位。
+    /// 8 digits.
     Eight,
 }
 
@@ -376,12 +411,12 @@ impl From<FfiDigits> for Digits {
     }
 }
 
-/// `otpauth://` 的类型。
+/// Type of an `otpauth://` URI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiUriType {
-    /// 基于时间。
+    /// Time-based.
     Totp,
-    /// 基于计数器。
+    /// Counter-based.
     Hotp,
 }
 
@@ -403,37 +438,41 @@ impl From<FfiUriType> for uri::UriType {
     }
 }
 
-/// 解析后的 `otpauth://` 条目。
+/// A parsed `otpauth://` entry.
 ///
-/// 字段与核心的 [`uri::OtpAuth`] 一一对应，唯一区别是 `secret` 以 Base32 字符串
-/// 而非 `OtpSecret` 出现（见模块文档）。
+/// The fields correspond one-to-one to the core [`uri::OtpAuth`]; the only
+/// difference is that `secret` appears as a Base32 string rather than as an
+/// `OtpSecret` (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiOtpAuth {
-    /// TOTP 还是 HOTP。
+    /// TOTP or HOTP.
     pub uri_type: FfiUriType,
-    /// 种子，Base32 编码（大写）。
+    /// The secret, Base32 encoded (upper case).
     pub secret_base32: String,
-    /// 发行方（服务名），如 `GitHub`。
+    /// Issuer (service name), such as `GitHub`.
     pub issuer: Option<String>,
-    /// 账号名，如 `alice@example.com`。
+    /// Account name, such as `alice@example.com`.
     pub account: String,
-    /// 使用的哈希算法。
+    /// Hash algorithm in use.
     pub algorithm: FfiAlgorithm,
-    /// 验证码位数。
+    /// Number of digits in a code.
     pub digits: FfiDigits,
-    /// 时间步长（秒）。
+    /// Time step in seconds.
     ///
-    /// **不变量**：HOTP 条目此值恒为核心默认值且无意义（HOTP 按计数器推进）。
-    /// 与核心 [`uri::OtpAuth::period`] 的约定一致。
+    /// **Invariant**: for HOTP entries this value is always the core default and
+    /// has no meaning (HOTP advances by counter). It follows the convention of
+    /// the core [`uri::OtpAuth::period`].
     pub period: u64,
-    /// HOTP 的计数器。TOTP 时为 `None`。
+    /// The HOTP counter. `None` for TOTP.
     pub counter: Option<u64>,
 }
 
-/// 检查字符串长度上限，超限则报 [`FfiError::InputTooLong`]。
+/// Checks a string length limit and returns [`FfiError::InputTooLong`] when it is
+/// exceeded.
 ///
-/// 按**字符数**而非字节数计——端侧传来的字符串可能含多字节字符，按字节计会让
-/// 含中文 issuer 的 URI 更容易触发上限，行为难以向用户解释。
+/// The limit counts **characters**, not bytes: strings arriving from the host
+/// side may contain multi-byte characters, and counting bytes would make such
+/// input hit the limit sooner than the reported character count suggests.
 fn check_len(kind: &str, value: &str, limit: usize) -> Result<(), FfiError> {
     let actual = value.chars().count();
     if actual > limit {
@@ -446,15 +485,17 @@ fn check_len(kind: &str, value: &str, limit: usize) -> Result<(), FfiError> {
     Ok(())
 }
 
-/// 解析 `otpauth://` URI。
+/// Parses an `otpauth://` URI.
 ///
-/// 完整实现 Google Authenticator Key URI Format 的解析与校验，包含
-/// issuer/account 前缀一致性检查、重复参数拒绝、百分号解码等。
+/// Parses and validates the Google Authenticator Key URI Format, including the
+/// issuer/account prefix consistency check, rejection of repeated parameters and
+/// percent decoding.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 输入超长返回 [`FfiError::InputTooLong`]；其余返回核心错误
-/// （[`FfiError::Core`]），含义见核心 `Error` 的文档。
+/// Returns [`FfiError::InputTooLong`] when the input is too long; otherwise
+/// returns a core error ([`FfiError::Core`]) whose meaning is documented on the
+/// core `Error`.
 #[uniffi::export]
 pub fn parse_otpauth_uri(uri: String) -> Result<FfiOtpAuth, FfiError> {
     check_len("uri", &uri, MAX_URI_CHARS)?;
@@ -479,18 +520,17 @@ pub fn parse_otpauth_uri(uri: String) -> Result<FfiOtpAuth, FfiError> {
     })
 }
 
-/// 把 [`FfiOtpAuth`] 序列化回 `otpauth://` URI。
+/// Serializes an [`FfiOtpAuth`] back into an `otpauth://` URI.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 账号名含 `:` 时核心会拒绝——该字符与 `issuer:account` 的分隔符不可区分，
-/// 强行编码会导致「写出去再读回来，issuer/account 归属变了」。这是**有意的**
-/// 拒绝，不是缺陷。
+/// The core rejects an account name containing `:` — that character is
+/// indistinguishable from the `issuer:account` separator, so encoding it would
+/// change which part of a round-tripped URI belongs to the issuer and which to
+/// the account. The rejection is intentional.
 #[uniffi::export]
 pub fn serialize_otpauth_uri(auth: FfiOtpAuth) -> Result<String, FfiError> {
     check_len("secret", &auth.secret_base32, MAX_SECRET_CHARS)?;
-    // 先按引用读出需要移动的字段，再构造核心类型——直接写
-    // `issuer: auth.issuer` 会在同一函数里既借又移，编译器会拒绝。
     let secret = OtpSecret::from_base32(&auth.secret_base32)?;
     let core_auth = uri::OtpAuth {
         uri_type: auth.uri_type.into(),
@@ -505,12 +545,15 @@ pub fn serialize_otpauth_uri(auth: FfiOtpAuth) -> Result<String, FfiError> {
     Ok(uri::serialize(&core_auth)?)
 }
 
-/// 计算 TOTP 验证码。
+/// Computes a TOTP code.
 ///
-/// `unix_time` 是 Unix 秒，**由端侧提供**——核心不读时钟，这是刻意的：只有时间
-/// 作为参数传入，RFC 6238 的测试向量才能被确定性地验证。端侧应传系统时钟秒数。
+/// `unix_time` is Unix seconds and is **supplied by the host side**: the core
+/// does not read a clock, so time always enters as a parameter, which is what
+/// makes the RFC 6238 test vectors verifiable. The host side should pass the
+/// system clock in seconds.
 ///
-/// 返回值是定宽十进制字符串（含前导零），长度由 `digits` 决定。
+/// The return value is a fixed-width decimal string (leading zeros included)
+/// whose length is given by `digits`.
 #[uniffi::export]
 pub fn totp_code(
     secret_base32: String,
@@ -530,7 +573,7 @@ pub fn totp_code(
     )?)
 }
 
-/// 计算 HOTP 验证码。
+/// Computes an HOTP code.
 #[uniffi::export]
 pub fn hotp_code(
     secret_base32: String,
@@ -548,9 +591,9 @@ pub fn hotp_code(
     ))
 }
 
-/// 计算 Steam Guard 验证码（5 位，自定义字母表）。
+/// Computes a Steam Guard code (5 characters, custom alphabet).
 ///
-/// `period` 通常传 30——Steam 使用 30 秒步长。
+/// `period` is normally 30, the time step Steam uses.
 #[uniffi::export]
 pub fn steam_guard_code(
     secret_base32: String,
@@ -568,17 +611,19 @@ pub fn steam_guard_code(
     )?)
 }
 
-/// 校验用户输入的验证码，允许时间漂移。
+/// Verifies a user-supplied code, allowing for clock drift.
 ///
-/// `expected_counter` 是当前时间对应的计数器（`unix_time / period`）。
-/// `window` 是允许的漂移步数（RFC 6238 建议 1，即 ±1 步）。
+/// `expected_counter` is the counter for the current time (`unix_time / period`).
+/// `window` is the number of steps of drift allowed (RFC 6238 suggests 1, that
+/// is ±1 step).
 ///
-/// 返回命中的偏移量：`0` 表示当前步命中，`-1` 表示落后一步，`1` 表示超前一步，
-/// 依此类推。**返回偏移量而非布尔值**，是为了让端侧据此校准该条目的时钟偏差，
-/// 而不是只得到「对/错」。
+/// The return value is the offset that matched: `0` for the current step, `-1`
+/// for one step behind, `1` for one step ahead, and so on. The offset is
+/// **returned instead of a boolean** so that the host side can calibrate that
+/// entry's clock deviation rather than only learn right or wrong.
 ///
-/// 比较使用常量时间实现，不会因「前几位对了」而提前返回。
-/// 返回 `None` 表示校验失败（含输入格式不对的情况）。
+/// The comparison is constant time and does not return early on a matching
+/// prefix. `None` means verification failed, including a malformed input code.
 #[uniffi::export]
 pub fn verify_code_with_drift(
     secret_base32: String,
@@ -600,30 +645,31 @@ pub fn verify_code_with_drift(
     ))
 }
 
-/// 常量时间地比较两个验证码字符串是否相同。
+/// Compares two code strings for equality in constant time.
 ///
-/// 用于端侧已自行算出验证码的场景。若需要容错时钟漂移，用
-/// [`verify_code_with_drift`]。
+/// For host-side code that has already computed the expected code itself. Use
+/// [`verify_code_with_drift`] when clock drift must be tolerated.
 #[uniffi::export]
 #[must_use]
 pub fn codes_match(expected: String, provided: String) -> bool {
     otp::verify_code(&expected, &provided)
 }
 
-/// 该算法建议的最小种子长度（字节）。
+/// Recommended minimum secret length in bytes for the given algorithm.
 ///
-/// 用于端侧在导入条目时给出**告警**而非拒绝——核心刻意不强制最小长度，因为
-/// 真实世界存在短种子，硬拒会让用户无法导入本可用的账号。
+/// Intended for a **warning** on import rather than a rejection: the core does
+/// not enforce a minimum length, since short secrets exist in practice.
 #[uniffi::export]
 #[must_use]
 pub fn recommended_min_secret_len(algorithm: FfiAlgorithm) -> u64 {
     otp::recommended_min_secret_len(algorithm.into()) as u64
 }
 
-/// 判断种子是否短于建议长度。
+/// Reports whether the secret is shorter than the recommended length.
 ///
-/// 比让端侧自行比较长度更好：端侧拿不到种子的**字节**长度（只有 Base32 字符串），
-/// 而 Base32 长度与字节长度非线性相关（5 位/字符 vs 8 位/字节），端侧自己算易错。
+/// The host side cannot compare lengths itself: it only has the Base32 string,
+/// and the Base32 length is not linearly related to the byte length (5 bits per
+/// character versus 8 bits per byte).
 #[uniffi::export]
 pub fn is_secret_shorter_than_recommended(
     secret_base32: String,
@@ -634,9 +680,9 @@ pub fn is_secret_shorter_than_recommended(
     Ok(secret.is_shorter_than_recommended(algorithm.into()))
 }
 
-/// 种子的**字节**长度（不是 Base32 字符串长度）。
+/// The **byte** length of the secret (not the Base32 string length).
 ///
-/// 供端侧显示「20 字节 / 建议 20 字节」这类提示。
+/// Intended for host-side messages such as "20 bytes / 20 recommended".
 #[uniffi::export]
 pub fn secret_byte_len(secret_base32: String) -> Result<u64, FfiError> {
     check_len("secret", &secret_base32, MAX_SECRET_CHARS)?;
@@ -644,22 +690,18 @@ pub fn secret_byte_len(secret_base32: String) -> Result<u64, FfiError> {
     Ok(secret.len() as u64)
 }
 
-/// 生成一个随机的 256 位种子并返回其 Base32 表示。
+/// Generates a random 256-bit secret and returns its Base32 representation.
 ///
-/// 用于「新建条目时自动生成种子」。随机数来自 OS CSPRNG（`getrandom`），
-/// **不是**用户态 PRNG。
+/// Intended for generating a secret when a new entry is created. Randomness
+/// comes from the OS CSPRNG (`getrandom`), not from a user-space PRNG.
 ///
-/// 256 位是刻意的选择：它是 SHA-256 的输出长度，且远超所有受支持算法建议的
-/// 最小长度（20/32/64 字节中最大者为 64 字节 = 512 位，故这里取 32 字节
-/// 对 SHA-256 是等长、对 SHA-512 偏短但仍在建议区间之上）。
+/// 256 bits is the output length of SHA-256 and is above the recommended
+/// minimum of every supported algorithm: the largest of the recommended minima
+/// is 64 bytes (512 bits), so 32 bytes is equal in length to SHA-256's output,
+/// shorter than SHA-512's block but still above its recommended minimum.
 #[uniffi::export]
 pub fn generate_secret_base32() -> Result<String, FfiError> {
     let mut bytes = [0_u8; 32];
-    // `getrandom` 经核心传递引入，用同一份避免版本漂移（与核心对 `zeroize`
-    // 的处理一致：需要用到传递依赖时从上游取，不另开直接依赖）。
-    //
-    // 映射到核心的 `RandomnessUnavailable` 而不是在这里自造错误：随机源
-    // 属于核心的职责，错误分类也应由核心统一，FFI 层只做搬运。
     qualia2fa_core::getrandom::fill(&mut bytes).map_err(|_| FfiError::Core {
         detail: Error::RandomnessUnavailable.into(),
     })?;
@@ -667,10 +709,10 @@ pub fn generate_secret_base32() -> Result<String, FfiError> {
     Ok(secret.to_base32())
 }
 
-/// 核心库版本，供端侧做兼容性检查与问题排查。
+/// The core library version, for compatibility checks and diagnostics.
 ///
-/// 注意这是 `qualia2fa-core` 的版本，不是本 FFI crate 的版本——端侧真正需要
-/// 对齐的是核心的语义版本。
+/// This is the version of `qualia2fa-core`, not of this FFI crate: the semantic
+/// version the host side needs to align with is the core's.
 #[uniffi::export]
 #[must_use]
 pub fn core_version() -> String {
@@ -678,85 +720,101 @@ pub fn core_version() -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// M3：设备身份、注册与登录
+// Device identity, registration and login
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// # 本节的形状由「主密钥尽量不过边界」决定
+// The master key stays inside Rust wherever possible. The core `flow` module
+// takes its platform dependencies as two trait parameters, so orchestration
+// completes without the master key leaving Rust. This section has the same
+// shape:
 //
-// 主密钥是全部数据的钥匙，因此它在 FFI 边界上每出现一次都是一份可能残留的拷贝
-// （托管语言的字符串/数组不受 Rust 的 `zeroize` 控制）。核心的 `flow` 模块因此
-// 把平台依赖做成两个 trait 参数，让编排能在**主密钥不出 Rust** 的前提下完成。
+// - [`FfiVault`] **holds** the master key on the Rust side, and both entry
+//   operations and serialization happen inside Rust. The host side only
+//   receives vault file bytes and entry fields, never the master key: on the
+//   open / add entry / serialize path the master key does not cross the
+//   boundary at all.
+// - The master key crosses the boundary in exactly two places, both
+//   unavoidable: registration hands it to the platform key store
+//   ([`FfiSecureStore`]), and login reads it back out of the platform key
+//   store. Its permanent home is the host side's hardware key store, which only
+//   the host side can reach.
+// - [`FfiSecureStore`] therefore exchanges **bytes** rather than some key
+//   handle: the master key arrives and leaves the host side as a 32-byte array.
 //
-// 本节沿用同一思路：
-//
-// - [`FfiVault`] 在 Rust 侧**持有**主密钥，条目操作与序列化都在 Rust 内完成。
-//   端侧只拿到保险库文件字节与条目字段，拿不到主密钥。Open / AddEntry / Serialize
-//   这一整条最常见的路径上，主密钥**一次都不过边界**。
-// - 主密钥只在两处必须过边界，而这两处都是**不可避免**的：注册时交给平台密钥库
-//   保管（[`FfiSecureStore`]），登录时从平台密钥库取出。它的永久归宿是端侧的
-//   硬件密钥库，而那个存储只有端侧能访问——这不是设计选择，是平台的既成事实。
-// - 因此[`FfiSecureStore`]的 trait 方法收发**字节**而不是某种句柄。把主密钥包成
-//   不透明句柄看似更干净，但那只是把同一份字节从「显式参数」挪到「端侧自己存」，
-//   边界上的拷贝一次都没少，反而让「密钥到底存在哪」变得不明确。
-//
-// 端侧的最小实现方式因此是：把这两个 trait 直接转发给平台的密钥库 API，
-// **不要在其中加入判断**——任何判断都应当回到 Hassle 层，那里有测试。
+// The minimal host-side implementation is to forward these two traits straight
+// to the platform key store API, **with no decisions of its own**: any decision
+// belongs in the core layer.
 
-/// 设备身份密钥对的来源：由端侧转发给平台硬件密钥库。
+/// Source of the device identity key pair: forwarded by the host side to the
+/// platform hardware key store.
 ///
-/// 对应核心的 [`qualia2fa_core::flow::DeviceKeys`]。端侧实现应当直接转发给
-/// `qualia2fa-keystore` 等平台层，**不要在其中加入判断**。
+/// Corresponds to the core [`qualia2fa_core::flow::DeviceKeys`]. An
+/// implementation should forward directly to the platform layer, **with no
+/// decisions of its own**.
 ///
-/// # 实现方必须满足的契约
+/// # Contract the implementation must satisfy
 ///
-/// - **`getOrCreate` 对同一 `label` 必须是幂等的。** 每次调用都新建一对密钥，
-///   会让用户在重启后打不开自己的数据——旧身份对应的条目再也解不开，而界面上
-///   看不出任何异常。
-/// - **密钥必须立即持久化**，不能攒到「会话结束」再写。签名调用可能来自另一次
-///   进程启动。
-/// - **`sign` 收到的是原始消息，不是摘要。** 端侧不得先做一次哈希——那会与
-///   核心的验签路径（标准 ECDSA 哈希模式）叠加成「哈希两次」，症状是每次配对都
-///   报 `DeviceSignatureInvalid`，而密钥与消息看上去都对。
+/// - **`get_or_create` must be idempotent for the same `label`.** A label names
+///   one key pair for the lifetime of the device.
+/// - **A key must be persisted immediately**, not buffered until the end of a
+///   session: a signing call may arrive in a later process start.
+/// - **`sign` receives the raw message, not a digest.** The host side must not
+///   hash it first: the core verifies with the standard ECDSA hash mode, so
+///   hashing twice makes verification report `DeviceSignatureInvalid` while the
+///   key and the message are both correct.
 #[uniffi::export(with_foreign)]
 pub trait FfiDeviceKeys: Send + Sync {
-    /// 取得该 `label` 的公钥（不存在则创建）。SEC1 未压缩编码，65 字节。
+    /// Returns the public key for `label`, creating it when it does not exist.
+    /// SEC1 uncompressed encoding, 65 bytes.
     fn get_or_create(&self, label: String) -> Result<Vec<u8>, FfiError>;
 
-    /// 用该 `label` 的私钥对**原始消息**签名。返回 64 字节原始 `r‖s`（非 DER）。
+    /// Signs the **raw message** with the private key for `label`. Returns the
+    /// 64-byte raw `r‖s`, not DER.
     fn sign(&self, label: String, message: Vec<u8>) -> Result<Vec<u8>, FfiError>;
 }
 
-/// 主密钥的持久化位置：由端侧转发给平台硬件密钥库。
+/// Where the master key is persisted: forwarded by the host side to the
+/// platform hardware key store.
 ///
-/// 对应核心的 [`qualia2fa_core::flow::SecureStore`]。
+/// Corresponds to the core [`qualia2fa_core::flow::SecureStore`].
 ///
-/// # `load` 返回 `None` 与返回 `Err` 是两件不同的事
+/// # `load` returning `None` and returning `Err` are two different things
 ///
-/// - `Ok(None)`：这台设备**从未注册过**。界面应当引导用户去注册或登录。
-/// - `Err(..)`：设备注册过，但密钥现在读不出来（硬件被重置、密钥被删除、
-///   用户换了 Windows 账户）。界面应当**警告数据可能已丢失**，绝不能引导用户
-///   重新注册——那会用一个新主密钥覆盖旧数据，让原有条目永久不可恢复。
+/// - `Ok(None)`: this device was **never registered**. The user interface
+///   should guide the user to register or log in.
+/// - `Err(..)`: the device was registered, but the key cannot be read now
+///   (hardware reset, key deleted, different user account). The user interface
+///   must **warn that data may be lost** and must never guide the user to
+///   register again, since that would overwrite the old data with a new master
+///   key and make the existing entries permanently unrecoverable.
 ///
-/// 把这两种情况合并成一个 `None` 是本接口最容易犯的错，而上层界面无从分辨。
+/// Collapsing these two cases into one `None` is the easiest mistake at this
+/// interface, and the user interface above cannot tell them apart.
 #[uniffi::export(with_foreign)]
 pub trait FfiSecureStore: Send + Sync {
-    /// 读取主密钥，32 字节。从未注册过时返回 `None`。
+    /// Reads the master key, 32 bytes. Returns `None` when the device was never
+    /// registered.
     fn load_master_key(&self) -> Result<Option<Vec<u8>>, FfiError>;
 
-    /// 写入主密钥（32 字节），覆盖已有值。
+    /// Writes the master key (32 bytes), overwriting any existing value.
     fn store_master_key(&self, key: Vec<u8>) -> Result<(), FfiError>;
 
-    /// 删除主密钥。已取消注册的设备上调用不应报错。
+    /// Deletes the master key. Calling it on a device that was never registered
+    /// must not report an error.
     fn delete_master_key(&self) -> Result<(), FfiError>;
 
-    /// 该存储是否受硬件保护（TPM / Secure Enclave / Android Keystore）。
+    /// Whether this store is hardware backed (TPM / Secure Enclave / Android
+    /// Keystore).
     ///
-    /// **必须如实上报。** 没有硬件时返回 `false`，由界面征得用户同意后再继续；
-    /// 谎报会让用户以为自己受硬件保护，而私钥其实只是一个软件文件。
+    /// **Must be reported truthfully.** With no hardware available it returns
+    /// `false` and the user interface asks for consent before continuing;
+    /// claiming otherwise would tell the user that a software file is hardware
+    /// protected.
     fn is_hardware_backed(&self) -> bool;
 }
 
-/// 核心 `DeviceKeys` 的转发实现：把 trait 调用桥到端侧回调。
+/// Forwarding implementation of the core `DeviceKeys`: bridges trait calls to
+/// host-side callbacks.
 struct ForeignDeviceKeys(Arc<dyn FfiDeviceKeys>);
 
 impl qualia2fa_core::flow::DeviceKeys for ForeignDeviceKeys {
@@ -765,9 +823,6 @@ impl qualia2fa_core::flow::DeviceKeys for ForeignDeviceKeys {
             .0
             .get_or_create(label.to_owned())
             .map_err(ffi_to_core_error)?;
-        // `?` 把设备身份库的错误经核心的 `Error::Device` 转换过来（`#[from]` 提供）。
-        // 端侧回调报的错仍然走 `ffi_to_core_error`：那是**跨边界**的失败，与本地
-        // 解析失败不是一回事，两者不该混成一个分支。
         Ok(DevicePublicKey::from_sec1_bytes(&bytes)?)
     }
 
@@ -780,7 +835,8 @@ impl qualia2fa_core::flow::DeviceKeys for ForeignDeviceKeys {
     }
 }
 
-/// 核心 `SecureStore` 的转发实现：把 trait 调用桥到端侧回调。
+/// Forwarding implementation of the core `SecureStore`: bridges trait calls to
+/// host-side callbacks.
 struct ForeignSecureStore(Arc<dyn FfiSecureStore>);
 
 impl qualia2fa_core::flow::SecureStore for ForeignSecureStore {
@@ -806,19 +862,23 @@ impl qualia2fa_core::flow::SecureStore for ForeignSecureStore {
     }
 }
 
-/// 把端侧回调返回的 [`FfiError`] 还原成核心错误。
+/// Converts an [`FfiError`] returned by a host-side callback back into a core
+/// error.
 ///
-/// # 为什么是「还原」而不是「翻译」
+/// # Why this converts back rather than translates
 ///
-/// 回调里出现的错误绝大多数**本来就是核心错误**——端侧只是把它们原样传回来
-/// （例如平台密钥库报「硬件不可用」，那对应核心的
-/// [`Error::DeviceKeyMissing`]）。若在这里一律包成一个笼统的错误，核心拿到的
-/// 失败原因就退化了，而 `flow` 的失败处理正是按原因分支的。
+/// Almost all errors appearing in these callbacks **are core errors already**:
+/// the host side merely passes them back (for example, a platform key store
+/// reporting unavailable hardware, which corresponds to the core
+/// [`Error::DeviceKeyMissing`]). Wrapping them all in one generic error here
+/// would degrade the failure reason the core receives, and the error handling in
+/// `flow` branches on that reason.
 ///
-/// [`FfiError::Core`] 因此按 `kind` 反映射回核心变体。反映射做不到的（边界自身的
-/// [`FfiError::InputTooLong`]、以及未来新增的 kind）退化为
-/// [`Error::DeviceKeyMissing`]——那是一个「这台设备的密钥不可用」的诚实描述，
-/// 而不会让调用方以为一切正常。
+/// [`FfiError::Core`] is therefore mapped back to a core variant through `kind`.
+/// What cannot be mapped back — the boundary's own [`FfiError::InputTooLong`]
+/// and any kind added later — degrades to [`Error::DeviceKeyMissing`], an honest
+/// description of "the key on this device is unavailable" that does not let the
+/// caller believe everything is fine.
 fn ffi_to_core_error(source: FfiError) -> Error {
     match source {
         FfiError::Core { detail } => kind_to_core_error(&detail.kind),
@@ -826,12 +886,14 @@ fn ffi_to_core_error(source: FfiError) -> Error {
     }
 }
 
-/// 把稳定的错误标识反映射回核心错误变体。
+/// Maps a stable error kind back to a core error variant.
 ///
-/// **只覆盖设备身份相关的那些**：本函数只被跨回调的路径用到，而那几条路径上可能
-/// 出现的核心错误是有限的（密钥不存在、身份不匹配、存储写入失败）。其余一律退化
-/// 为 [`Error::DeviceKeyMissing`]，而不是硬凑一个语义不符的变体——错误分类错了比
-/// 分类粗更糟。
+/// **Only the device-identity-related ones**: this function is used on the
+/// callback-crossing paths, where the set of possible core errors is limited
+/// (missing key, mismatched identity, failed store write). Everything else
+/// degrades to [`Error::DeviceKeyMissing`] rather than being forced into a
+/// variant whose meaning does not fit: a wrong classification is worse than a
+/// coarse one.
 fn kind_to_core_error(kind: &str) -> Error {
     match kind {
         "device_key_missing" => Error::DeviceKeyMissing,
@@ -845,48 +907,51 @@ fn kind_to_core_error(kind: &str) -> Error {
     }
 }
 
-/// 一条 2FA 条目，跨 FFI 边界的表示。
+/// A 2FA entry, as represented across the FFI boundary.
 ///
-/// 与 [`uri::OtpAuth`] 的关系：那个是 `otpauth://` URI 的解析结果，这个是保险库
-/// 里存的东西。两者字段相近但**不等价**——保险库条目多了显示名、备注与时间戳，
-/// 少了「URI 类型」（HOTP 由 `counter` 是否为 `None` 表达）。
+/// Relation to [`uri::OtpAuth`]: that type is the parse result of an `otpauth://`
+/// URI, while this one is what a vault stores. The fields are similar but **not
+/// equivalent** — a vault entry adds a display name, a note and timestamps, and
+/// has no "URI type" field (HOTP is expressed by `counter` being `None`).
 ///
-/// # `id` 为什么是字符串
+/// # Why `id` is a string
 ///
-/// 核心的 [`EntryId`](qualia2fa_core::vault::EntryId) 是 16 字节，但端侧只会把
-/// 它当成不透明的标识来传递与比较（列表项 key、删除时指认哪一条）。用十六进制
-/// 字符串而不是 `Vec<u8>`：托管语言里字节数组的相等性/哈希语义常常是引用比较，
-/// 而字符串是值语义，端侧不必为此写额外代码。
+/// The core's [`EntryId`](qualia2fa_core::vault::EntryId) is 16 bytes, but the
+/// host side only passes it around and compares it as an opaque identifier
+/// (list item key, naming an entry to delete). A hexadecimal string is used
+/// instead of `Vec<u8>` because in managed languages byte-array equality and
+/// hashing are often by reference, whereas strings have value semantics.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiVaultEntry {
-    /// 条目标识，32 位十六进制小写字符串。
+    /// Entry identifier, a 32-character lower-case hexadecimal string.
     pub id: String,
-    /// 显示名。
+    /// Display name.
     pub name: String,
-    /// 发行方（服务名）。
+    /// Issuer (service name).
     pub issuer: Option<String>,
-    /// 账号名。
+    /// Account name.
     pub account: String,
-    /// 种子，Base32 编码（大写）。见模块文档对种子表示的约定。
+    /// The secret, Base32 encoded (upper case). See the module documentation for
+    /// the secret representation.
     pub secret_base32: String,
-    /// 使用的哈希算法。
+    /// Hash algorithm in use.
     pub algorithm: FfiAlgorithm,
-    /// 验证码位数。
+    /// Number of digits in a code.
     pub digits: FfiDigits,
-    /// 时间步长（秒）。HOTP 条目此值无意义。
+    /// Time step in seconds. Meaningless for HOTP entries.
     pub period: u64,
-    /// HOTP 的计数器。TOTP 条目为 `None`。
+    /// The HOTP counter. `None` for TOTP entries.
     pub counter: Option<u64>,
-    /// 用户备注。
+    /// User note.
     pub note: String,
-    /// 创建时间（Unix 秒）。
+    /// Creation time in Unix seconds.
     pub created_at: u64,
-    /// 最后修改时间（Unix 秒）。
+    /// Last modification time in Unix seconds.
     pub updated_at: u64,
 }
 
 impl FfiVaultEntry {
-    /// 把核心条目转成跨边界表示。
+    /// Converts a core entry into its cross-boundary representation.
     fn from_core(id: &qualia2fa_core::vault::EntryId, entry: &Entry) -> Self {
         Self {
             id: id.to_string(),
@@ -912,7 +977,7 @@ impl FfiVaultEntry {
         }
     }
 
-    /// 构造核心条目。`now` 用于填充创建/修改时间。
+    /// Builds a core entry. `now` fills in the creation and modification times.
     fn to_core(&self, now: u64) -> Result<Entry, FfiError> {
         check_len("secret", &self.secret_base32, MAX_SECRET_CHARS)?;
         check_len("name", &self.name, MAX_VAULT_FIELD_CHARS)?;
@@ -937,18 +1002,17 @@ impl FfiVaultEntry {
         )?)
     }
 
-    /// 解析 16 字节的十六进制标识。
+    /// Parses the 16-byte hexadecimal identifier.
     fn parse_id(&self) -> Result<qualia2fa_core::vault::EntryId, FfiError> {
         parse_entry_id(&self.id)
     }
 }
 
-/// 解析 `EntryId` 的十六进制表示（32 个小写十六进制字符）。
+/// Parses the hexadecimal representation of an `EntryId` (32 lower-case
+/// hexadecimal characters).
 fn parse_entry_id(text: &str) -> Result<qualia2fa_core::vault::EntryId, FfiError> {
     check_len("entry_id", text, 32)?;
     let bytes = text.as_bytes();
-    // 长度先判：下面的按 2 分组假设了偶数长度，而奇数长度会让最后一组只有一个
-    // 字符——那是「截断的 ID」在界面上的表现，必须报错而不是补零。
     if bytes.len() != 32 {
         return Err(FfiError::Core {
             detail: Error::UriInvalidParameter {
@@ -967,7 +1031,7 @@ fn parse_entry_id(text: &str) -> Result<qualia2fa_core::vault::EntryId, FfiError
     Ok(qualia2fa_core::vault::EntryId::from_bytes(id))
 }
 
-/// 单个十六进制字符 → 数值。
+/// One hexadecimal character → its value.
 fn hex_digit(byte: u8) -> Result<u8, FfiError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -983,44 +1047,49 @@ fn hex_digit(byte: u8) -> Result<u8, FfiError> {
     }
 }
 
-/// 一个已解锁的保险库。
+/// An unlocked vault.
 ///
-/// # 主密钥不过边界
+/// # The master key does not cross the boundary
 ///
-/// 本对象在 Rust 侧**持有**主密钥，条目操作与序列化都在 Rust 内完成。因此
-/// 「打开保险库 → 读条目 → 写条目 → 存回文件」这条最常见的路径上，主密钥一次都
-/// 不会以字节形式出现在 Kotlin/Swift 里。这是本对象存在的主要理由——如果端侧
-/// 自己拿着主密钥，每一次列表刷新都要把它传进来一次。
+/// This object **holds** the master key on the Rust side, and entry operations
+/// and serialization happen inside Rust. On the open vault → read entries →
+/// write entries → serialize path, the master key never appears as bytes in
+/// Kotlin or Swift.
 ///
-/// # 端侧的生命周期
+/// # Host-side lifetime
 ///
-/// 端侧应当在用户解锁应用时构造本对象，在应用进入后台或用户锁定应用时**丢弃**它
-/// （`null` 掉引用）。对象被 GC 时 Rust 侧的 `Drop` 会擦除主密钥；但那取决于 GC
-/// 时机，因此**不要**依赖 GC 来锁屏——「锁屏」必须是真的丢掉引用，并让界面重新
-/// 要求解锁。
+/// The host side constructs this object when the user unlocks the application
+/// and **discards** it (drops the reference) when the application goes to the
+/// background or the user locks it. The Rust-side `Drop` wipes the master key
+/// when the object is collected, but that depends on collection timing, so
+/// locking **must not** rely on the collector: locking means actually dropping
+/// the reference and letting the user interface ask for an unlock again.
 #[derive(uniffi::Object)]
 pub struct FfiVault {
-    /// 核心的保险库状态，含主密钥。
+    /// The core vault state, including the master key.
     ///
-    /// # 为什么是 `Mutex` 而不是直接放 `VaultFile`
+    /// # Why `Mutex` rather than a plain `VaultFile`
     ///
-    /// UniFFI 导出 `&mut self` 方法时要求对象以 `Arc<Self>` 共享，而 `Arc` 不给
-    /// 可变借用——所以内部状态需要一个提供内部可变性的容器。`Mutex` 而不是
-    /// `RefCell`：`Mutex` 是 `Send + Sync`，而 `RefCell` 不是，UniFFI 的
-    /// `#[Object]` 要求 `Send + Sync`。
+    /// UniFFI shares exported objects as `Arc<Self>`, and `Arc` grants no
+    /// mutable borrow, so interior state needs a container that offers interior
+    /// mutability. `Mutex` rather than `RefCell` because `Mutex` is
+    /// `Send + Sync`, which UniFFI's `#[Object]` requires.
     ///
-    /// **锁的粒度是「一次方法调用」**，锁内只有内存操作（哈希表增删、条目字段
-    /// 拷贝）。加密与 Argon2 都在锁外：一次导出的 Argon2 要跑几百毫秒，若在锁内，
-    /// 并发的界面刷新会卡住。
+    /// **The lock granularity is one method call**, and only in-memory work
+    /// happens under the lock (hash-table insert and remove, copying entry
+    /// fields). Encryption and Argon2 run outside the lock: one export
+    /// derivation takes hundreds of milliseconds, and holding the lock across it
+    /// would stall concurrent user-interface refreshes.
     ///
-    /// 中毒（poison）用 `unwrap_or_else` 吞掉：本锁保护的是数据结构，而方法内部
-    /// 没有会 panic 的代码。真要有 panic，恢复数据比让整个应用后续每次调用都失败
-    /// 更可取——后者会让用户彻底无法读写自己的条目。
+    /// Poisoning is absorbed with `unwrap_or_else`: this lock guards a data
+    /// structure, and the methods inside it contain no panicking code. Should a
+    /// panic happen anyway, recovering the data is preferable to failing every
+    /// later call, which would leave the user unable to read or write entries.
     inner: std::sync::Mutex<VaultFile>,
 }
 
 impl FfiVault {
-    /// 从核心保险库构造。
+    /// Builds from a core vault.
     fn wrap(inner: VaultFile) -> Arc<Self> {
         Arc::new(Self {
             inner: std::sync::Mutex::new(inner),
@@ -1030,50 +1099,56 @@ impl FfiVault {
 
 #[uniffi::export]
 impl FfiVault {
-    /// 用一份已有的主密钥建立一个空保险库。
+    /// Creates an empty vault from an existing master key.
     ///
-    /// 供两条路径使用：
+    /// Used by two paths:
     ///
-    /// - [`FfiJoiner::complete`] 之后：已经拿到主密钥、也已经写进平台存储，现在要
-    ///   一个能操作的保险库对象。
-    /// - [`import_recovery_key`] 之后：同上。
+    /// - after [`FfiJoiner::complete`]: the master key has been obtained and
+    ///   written to the platform store, and a vault object to operate on is now
+    ///   needed;
+    /// - after [`import_recovery_key`]: the same.
     ///
-    /// # 「空」是正常的
+    /// # An empty vault is expected
     ///
-    /// D5 之下主密钥与条目是**分开传**的：登录只带来钥匙，不带来内容。端侧拿到的
-    /// 第一个保险库必然是空的，条目要靠同步（M4）或本地文件取回。不要因为它空就
-    /// 以为登录失败。
+    /// The master key and the entries are **transferred separately**: logging in
+    /// brings the key, not the content. The first vault the host side obtains is
+    /// necessarily empty, and the entries come back through sync or from a local
+    /// file.
     ///
-    /// # 主密钥仍然不过边界（除了这一次）
+    /// # The master key crosses the boundary here, and only here
     ///
-    /// 参数是 32 字节明文——这是端侧手里已经有主密钥的场景，绕不开。但本函数之后，
-    /// 端侧可以把那 32 字节丢掉，后续一切都通过本对象进行。
+    /// The parameter is a 32-byte plaintext key — the case where the host side
+    /// already holds the master key, which cannot be avoided. After this call
+    /// the host side can drop those 32 bytes; everything later goes through this
+    /// object.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 长度不是 32 字节时返回 [`Error::MasterKeyWrongLength`]。
+    /// Returns [`Error::MasterKeyWrongLength`] when the length is not 32 bytes.
     #[uniffi::constructor]
     pub fn from_master_key(master_key: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let master = flow::master_key_from_bytes(master_key.into())?;
         Ok(Self::wrap(flow::empty_vault(master)))
     }
 
-    /// 注册一台新设备：生成主密钥、取得设备身份、并把主密钥交给平台密钥库。
+    /// Registers a new device: generates a master key, obtains a device
+    /// identity, and hands the master key to the platform key store.
     ///
-    /// # 这一步会做什么、不会做什么
+    /// # What this step does and does not do
     ///
-    /// **会**：生成主密钥 → 取得设备身份 → 把主密钥写入 [`FfiSecureStore`]。
-    /// **不会**创建保险库文件，也不会写磁盘。返回的是一个空的 [`FfiVault`]，
-    /// 端侧往里面加完第一批条目后调用 [`FfiVault::serialize`] 落盘。
+    /// **Does**: generate the master key → obtain the device identity → write
+    /// the master key into [`FfiSecureStore`].
+    /// **Does not** create a vault file or write to disk. It returns an empty
+    /// [`FfiVault`]; the host side adds the first entries and then calls
+    /// [`FfiVault::serialize`] to persist them.
     ///
-    /// 之所以不让这一步自己写文件：「先写一个空保险库、写完条目再写一次」会让最终
-    /// 内容取决于哪一次成功，而端侧无从判断。一次写完，内容就是确定的。
+    /// # Errors
     ///
-    /// # 错误
-    ///
-    /// 设备身份创建失败、主密钥写入失败时返回相应错误，**此时磁盘上不会留下任何
-    /// 东西**（本函数不写文件）。平台密钥库可能不可用，端侧应当把它当作一个需要
-    /// 告知用户的状态，而不是重试。
+    /// Returns the corresponding error when creating the device identity or
+    /// writing the master key fails, and in that case **leaves nothing on disk**
+    /// (this function writes no file). The platform key store may be
+    /// unavailable; the host side should treat that as a state to report to the
+    /// user rather than retry.
     #[uniffi::constructor]
     pub fn register(
         keys: Arc<dyn FfiDeviceKeys>,
@@ -1087,24 +1162,30 @@ impl FfiVault {
         Ok(Self::wrap(registered.into_vault()))
     }
 
-    /// 用平台密钥库里的主密钥打开保险库文件。
+    /// Opens a vault file with the master key from the platform key store.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 设备从未注册过时返回 [`Error::DeviceNotRegistered`]（`kind` 为
-    /// `device_not_registered`）；主密钥存在但文件解不开时返回
-    /// [`Error::VaultDecryptionFailed`]（`kind` 为 `vault_decryption_failed`）。
-    /// 端侧必须区分这两者——前者引导用户去注册/登录，后者要警告数据可能已损坏或
-    /// 主密钥被换过。合并处理会让用户在被引导重新注册时永久失去原有条目。
+    /// Returns [`Error::DeviceNotRegistered`] (`kind` is
+    /// `device_not_registered`) when the device was never registered, and
+    /// [`Error::VaultDecryptionFailed`] (`kind` is `vault_decryption_failed`)
+    /// when a master key exists but the file cannot be opened. The host side
+    /// must distinguish the two: the first guides the user to register or log
+    /// in, the second warns that the data may be damaged or that the master key
+    /// was replaced.
     ///
-    /// # 空保险库也能判定主密钥对错
+    /// # An empty vault also tells whether the master key is right
     ///
-    /// 格式版本 2 在文件末尾放了一个主密钥检查值，因此**条目为空的文件同样能判定**：
-    /// 主密钥不对就返回 [`Error::VaultDecryptionFailed`]，而不是等到用户加进第一条
-    /// 条目才暴露。端侧可以在打开成功后直接把「已解锁」呈现给用户。
+    /// Format version 2 places a master key check value at the end of the file,
+    /// so **a file with no entries is judged as well**: a wrong master key
+    /// returns [`Error::VaultDecryptionFailed`] immediately instead of only
+    /// after the user adds a first entry. The host side may therefore present
+    /// "unlocked" as soon as the open succeeds.
     ///
-    /// **版本 1 的旧文件仍然判定不了**——那份文件里确实没有可判定的信息。需要权威
-    /// 确认时用 [`FfiVerifier`] 的挑战-应答，它不依赖文件内容。
+    /// **Old version 1 files still cannot be judged** — such a file carries no
+    /// information to judge with. Use the challenge-response of [`FfiVerifier`]
+    /// for authoritative confirmation, since it does not depend on file
+    /// content.
     #[uniffi::constructor]
     pub fn open(store: Arc<dyn FfiSecureStore>, data: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let store = ForeignSecureStore(store);
@@ -1112,34 +1193,35 @@ impl FfiVault {
         Ok(Self::wrap(file))
     }
 
-    /// 条目数量。
+    /// Number of entries.
     #[must_use]
     pub fn entry_count(&self) -> u64 {
         self.lock().vault().len() as u64
     }
 
-    /// 是否没有任何条目。
+    /// Whether there are no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lock().vault().is_empty()
     }
 
-    /// 墓碑数量。
+    /// Number of tombstones.
     ///
-    /// 墓碑是「这条被删了」的记录，用于让删除在设备间同步。界面通常不需要显示它，
-    /// 但排错时有用。
+    /// A tombstone is the record that an entry was deleted, which lets the
+    /// deletion propagate between devices. User interfaces normally need not
+    /// show it, but it is useful when diagnosing.
     #[must_use]
     pub fn tombstone_count(&self) -> u64 {
         self.lock().vault().tombstone_count() as u64
     }
 
-    /// 当前的全部条目。
+    /// All current entries.
     ///
-    /// # 顺序
+    /// # Order
     ///
-    /// 返回顺序**不保证**，因为核心内部用哈希表索引。端侧要显示列表就必须自己
-    /// 排序（按名称、按创建时间等），不要依赖这个顺序稳定——依赖它会让列表在
-    /// 两次刷新之间跳来跳去。
+    /// The order is **not guaranteed**, because the core indexes entries with a
+    /// hash table. The host side must sort the list itself (by name, by creation
+    /// time, and so on) and must not rely on this order being stable.
     #[must_use]
     pub fn entries(&self) -> Vec<FfiVaultEntry> {
         self.lock()
@@ -1149,7 +1231,7 @@ impl FfiVault {
             .collect()
     }
 
-    /// 按标识取一条条目。不存在时返回 `None`。
+    /// Returns one entry by identifier. `None` when it does not exist.
     #[must_use]
     pub fn entry(&self, id: String) -> Option<FfiVaultEntry> {
         let id = parse_entry_id(&id).ok()?;
@@ -1159,9 +1241,10 @@ impl FfiVault {
             .map(|entry| FfiVaultEntry::from_core(&id, entry))
     }
 
-    /// 新增一条条目，返回它的标识。
+    /// Adds an entry and returns its identifier.
     ///
-    /// `now` 是 Unix 秒，**由端侧提供**——核心不读时钟。
+    /// `now` is Unix seconds, **supplied by the host side** — the core does not
+    /// read a clock.
     pub fn add_entry(&self, entry: FfiVaultEntry, now: u64) -> Result<String, FfiError> {
         flow::check_now(now)?;
         let core = entry.to_core(now)?;
@@ -1169,67 +1252,69 @@ impl FfiVault {
         Ok(id.to_string())
     }
 
-    /// 修改一条已有条目。
+    /// Modifies an existing entry.
     ///
-    /// 找不到该标识时返回 [`Error::VaultEntryNotFound`]（`kind` 为
-    /// `vault_entry_not_found`）。
+    /// Returns [`Error::VaultEntryNotFound`] (`kind` is `vault_entry_not_found`)
+    /// when the identifier is not found.
     ///
-    /// # 为什么不用「先删后加」
+    /// # The identifier is preserved
     ///
-    /// 先删后加会换掉条目标识，而标识是设备间谈论「同一条条目」的唯一依据：换标识
-    /// 会被同步当成「删了一条、又加了一条」，另一台设备上该条目的历史与墓碑全部
-    /// 错位。修改必须**保持标识**。
+    /// The identifier is the only thing by which devices refer to "the same
+    /// entry": changing it reads as one deletion plus one insertion during sync,
+    /// which misplaces that entry's history and tombstone on other devices.
+    /// Modification must therefore **keep the identifier**.
     ///
-    /// 因此这里的做法是取出旧条目、替换内容、用**同一个**标识放回去。创建时间也
-    /// 保留：它记录的是「用户什么时候加进来的」，改一次名字就变掉会让界面上的排序
-    /// 跳位。
+    /// So this takes out the old entry, replaces its content and puts it back
+    /// under the **same** identifier. The creation time is preserved as well: it
+    /// records when the user added the entry, and letting it change would make
+    /// the user interface reorder rows.
     pub fn update_entry(&self, entry: FfiVaultEntry, now: u64) -> Result<(), FfiError> {
         flow::check_now(now)?;
         let id = entry.parse_id()?;
         let mut core = entry.to_core(now)?;
-        // `mut` 是必须的：`MutexGuard` 的可变访问来自它的 `DerefMut`，而那需要
-        // guard 本身可变。
         let mut vault = self.lock();
-        // 先取出旧条目：既为了确认它存在，也为了保住它的创建时间。
         let created_at = vault
             .vault()
             .get(&id)
             .ok_or(Error::VaultEntryNotFound)?
             .created_at;
         core.created_at = created_at;
-        // `Vault::replace` 而不是「remove + insert_with_id」：后者会**留下墓碑**，
-        // 而一次改名不是删除。墓碑会被同步出去，另一端可能据此把条目真的删掉。
         vault.vault_mut().replace(id, core)?;
         Ok(())
     }
 
-    /// 删除一条条目，留下墓碑。
+    /// Deletes an entry, leaving a tombstone.
     ///
-    /// 返回是否删掉了一条（`false` 表示该标识本来就不存在）。
+    /// Returns whether an entry was deleted (`false` means the identifier did
+    /// not exist).
     ///
-    /// # 墓碑是删除的正确形式
+    /// # A tombstone is how deletion is recorded
     ///
-    /// 直接抹掉记录会让另一台设备在下次同步时把这条**重新带回来**——它不知道这边
-    /// 删过。墓碑就是「这条被删了」这件事本身，它要跟着条目一起同步。
+    /// Erasing the record outright would make another device bring the entry
+    /// **back** at the next sync, since it does not know about the deletion
+    /// here. The tombstone is the fact "this entry was deleted" and travels with
+    /// the entries.
     pub fn remove_entry(&self, id: String, now: u64) -> Result<bool, FfiError> {
         flow::check_now(now)?;
         let id = parse_entry_id(&id)?;
         Ok(self.lock().vault_mut().remove(&id, now).is_some())
     }
 
-    /// 序列化成保险库文件字节，供端侧落盘。
+    /// Serializes into vault file bytes for the host side to persist.
     ///
-    /// 端侧应当**原子地**写文件（先写临时文件再改名），不要就地覆盖：写到一半
-    /// 断电会留下一个解不开的文件，而用户唯一的一份数据就在里面。核心提供了
-    /// `vault::write_file_atomically`，但它做 I/O，不在本库的暴露范围内，端侧需
-    /// 自行实现等价语义。
+    /// The host side should write the file **atomically** (write a temporary
+    /// file, then rename) rather than overwrite in place: losing power halfway
+    /// leaves a file that cannot be opened, and the user's only copy of the data
+    /// is inside it. The core provides `vault::write_file_atomically`, but it
+    /// performs I/O and is not part of this library's exported surface.
     pub fn serialize(&self) -> Result<Vec<u8>, FfiError> {
         Ok(self.lock().serialize()?)
     }
 
-    /// 计算某条条目当前的验证码。
+    /// Computes the current code for one entry.
     ///
-    /// `unix_time` 由端侧提供（核心不读时钟）。HOTP 条目用 [`FfiVault::hotp_for`]。
+    /// `unix_time` is supplied by the host side (the core does not read a
+    /// clock). Use [`FfiVault::hotp_for`] for HOTP entries.
     pub fn totp_for(&self, id: String, unix_time: u64) -> Result<String, FfiError> {
         self.code_for(&id, |entry| {
             otp::totp_code(
@@ -1242,7 +1327,7 @@ impl FfiVault {
         })
     }
 
-    /// 计算某条 HOTP 条目在指定计数器上的验证码。
+    /// Computes the code for one HOTP entry at the given counter.
     pub fn hotp_for(&self, id: String, counter: u64) -> Result<String, FfiError> {
         self.code_for(&id, |entry| {
             Ok(otp::hotp_code(
@@ -1254,33 +1339,39 @@ impl FfiVault {
         })
     }
 
-    /// 计算某条条目的 Steam Guard 验证码（5 位，自定义字母表）。
+    /// Computes the Steam Guard code for one entry (5 characters, custom
+    /// alphabet).
     pub fn steam_guard_for(&self, id: String, unix_time: u64) -> Result<String, FfiError> {
         self.code_for(&id, |entry| {
             otp::steam_guard_code(&entry.secret, unix_time, entry.period, entry.algorithm)
         })
     }
 
-    /// 用口令导出一份恢复密钥文件。
+    /// Exports a recovery key file protected by a passphrase.
     ///
-    /// # KDF 参数
+    /// # KDF parameters
     ///
-    /// `memory_kib` / `iterations` / `parallelism` 传 `None` 则用核心的推荐值
-    /// （64 MiB / 3 次 / 1 路）。**端侧不要为了「快」而调低它们**：导出时的耗时是
-    /// 一次性的，而攻击者拿到文件后是离线暴力破解，参数调低直接削弱用户的最后一道
-    /// 防线。
+    /// Passing `None` for `memory_kib` / `iterations` / `parallelism` uses the
+    /// core defaults (64 MiB / 3 iterations / 1 lane). The host side **must
+    /// not** lower them for speed: the export cost is paid once, whereas an
+    /// attacker who obtains the file attacks it offline, so lower parameters
+    /// weaken the last line of defence directly.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 参数超出核心允许的范围（内存上限 1 GiB、迭代上限 1000）时返回
-    /// [`Error::RecoveryParametersInvalid`]（`kind` 为 `recovery_parameters_invalid`）。
-    /// **上下界都要校验**，因为参数既可能来自端侧的滑块，也可能来自**别人的**文件。
+    /// Returns [`Error::RecoveryParametersInvalid`] (`kind` is
+    /// `recovery_parameters_invalid`) when the parameters fall outside the range
+    /// the core allows (memory at most 1 GiB, at most 1000 iterations). **Both
+    /// bounds are checked**, because the parameters can come from the host
+    /// side's sliders and from **someone else's** file.
     ///
-    /// # 返回值的处置
+    /// # Handling the return value
     ///
-    /// 调用方拿到的是**加了密的**文件字节，不是主密钥。端侧应当只把它写到用户选的
-    /// 位置或显示成二维码让用户抄下来，不要留在剪贴板历史里。口令本身不过本函数的
-    /// 返回值，端侧也不得持久化它。
+    /// The caller receives **encrypted** file bytes, not the master key. The
+    /// host side should only write them to a location the user chose or show
+    /// them as a QR code for the user to copy down, and should keep them out of
+    /// the clipboard history. The passphrase itself is not part of the return
+    /// value and must not be persisted by the host side.
     pub fn export_recovery_key(
         &self,
         passphrase: String,
@@ -1290,8 +1381,6 @@ impl FfiVault {
     ) -> Result<Vec<u8>, FfiError> {
         check_len("passphrase", &passphrase, MAX_PASSPHRASE_CHARS)?;
         let params = kdf_params(memory_kib, iterations, parallelism)?;
-        // 主密钥**不经过 `Vec<u8>`**：这里直接从锁内借出密钥引用，交给核心完成
-        // 派生与加密。把它先拷成字节再传，等于在 FFI 边界上凭空多一份明文拷贝。
         let vault = self.lock();
         Ok(flow::export_recovery_key(
             vault.master_key(),
@@ -1302,23 +1391,26 @@ impl FfiVault {
 }
 
 impl FfiVault {
-    /// 取得锁，忽略中毒。
+    /// Takes the lock, ignoring poisoning.
     ///
-    /// 中毒意味着某个持有锁的线程 panic 过。此时数据结构的**不变量**仍然成立
-    /// （本锁保护的是哈希表增删，没有「改了前半段就 panic」的中间状态），因此恢复
-    /// 使用比让后续每次调用都失败更好——后者会让用户彻底无法读写自己的条目。
+    /// Poisoning means a thread panicked while holding the lock. The data
+    /// structure's **invariants** still hold at that point (this lock guards
+    /// hash-table insert and remove, which have no half-modified intermediate
+    /// state), so recovering is preferable to failing every later call, which
+    /// would leave the user unable to read or write entries at all.
     fn lock(&self) -> std::sync::MutexGuard<'_, VaultFile> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// 取出条目的三个计算字段。
+    /// Computes the three derived fields of an entry.
     ///
-    /// 不返回 `&Entry`：条目住在 `MutexGuard` 后面，而 guard 在函数返回时就释放了，
-    /// 借用无法逃出去。核心的 `OtpSecret` 刻意不实现 `Clone`（那会让「秘密被静默
-    /// 复制」变成随手可做），因此这里**把验证码算完再返回字符串**，而不是把条目
-    /// 或种子拷贝出来——拷贝路径越短，明文在内存里停留的地方越少。
+    /// It does not return `&Entry`: entries live behind the `MutexGuard`, which
+    /// is released when the function returns, so a borrow cannot escape. The
+    /// core's `OtpSecret` deliberately does not implement `Clone`, so this
+    /// **computes the code and returns the string** rather than copying the
+    /// entry or the secret out.
     fn code_for(
         &self,
         id: &str,
@@ -1331,22 +1423,26 @@ impl FfiVault {
     }
 }
 
-/// 用 [`FfiVault`] 手里的主密钥打开保险库。
+/// Opens a vault with the master key held by an [`FfiVault`].
 ///
-/// # 返回的是一条字节串，而不是一个可打印的短码
+/// # The return value is a byte string, not a printable short code
 ///
-/// 恢复密钥文件被设计成「用户可以抄在纸上、也可以放进二维码」。它**不是**主密钥：
-/// 里面的主密钥由用户口令经 Argon2id 派生的密钥加密（见核心 `recovery` 模块）。
-/// 因此这里返回 `Vec<u8>` 是安全的，但端侧仍然不该把它写进日志或剪贴板历史。
+/// The recovery key file is designed so that a user can copy it onto paper or
+/// into a QR code. It is **not** the master key: the master key inside it is
+/// encrypted under a key derived from the user passphrase with Argon2id (see the
+/// core `recovery` module). Returning `Vec<u8>` is therefore safe, but the host
+/// side should still keep it out of logs and the clipboard history.
 ///
-/// # 与 [`FfiVault::export_recovery_key`] 的关系
+/// # Relation to [`FfiVault::export_recovery_key`]
 ///
-/// 两者做同一件事，区别只在主密钥从哪来：
+/// Both do the same thing; only the source of the master key differs:
 ///
-/// - [`FfiVault::export_recovery_key`]：设备**已经解锁**，主密钥在 Rust 侧。
-///   首选这条——主密钥一次都不过边界。
-/// - 本函数：调用方手里只有主密钥字节（例如刚刚通过 [`FfiJoiner::complete`] 拿到，
-///   还没来得及建保险库）。主密钥在这里过一次边界，是这条路径的固有代价。
+/// - [`FfiVault::export_recovery_key`]: the device is **already unlocked** and the
+///   master key is on the Rust side. Prefer that path — the master key does not
+///   cross the boundary at all.
+/// - this function: the caller only holds master key bytes (for example just
+///   obtained from [`FfiJoiner::complete`], before a vault exists). The master
+///   key crosses the boundary once here.
 #[uniffi::export]
 pub fn export_recovery_key_from_master(
     master_key: Vec<u8>,
@@ -1365,27 +1461,31 @@ pub fn export_recovery_key_from_master(
     )?)
 }
 
-/// 用口令从恢复密钥文件里取回主密钥，并**写入平台密钥库**。
+/// Recovers the master key from a recovery key file with a passphrase and
+/// **writes it into the platform key store**.
 ///
-/// 返回主密钥的 32 字节。端侧把它交给 [`FfiSecureStore::store_master_key`]，或者
-/// 直接丢掉——本函数已经在内部写过一次存储了。
+/// Returns the 32 bytes of the master key. The host side either passes them to
+/// [`FfiSecureStore::store_master_key`] or drops them, since this function has
+/// already written the store once.
 ///
-/// # 为什么返回值与内部写入都有
+/// # Why there is both a return value and an internal write
 ///
-/// 内部写入是为了让「恢复」与「登录」在存储这一步上行为一致（都走核心的
-/// `SecureStore` 抽象，因此顺序保证相同）。返回值是为了让端侧能立刻构造一个
-/// [`FfiVault`] 而不必再从密钥库读一次——读一次就多一次硬件访问，而有的平台每次
-/// 访问都会弹生物识别提示。
+/// The internal write makes recovery and login behave identically at the storage
+/// step (both go through the core `SecureStore` abstraction, so the ordering
+/// guarantees are the same). The return value lets the host side build an
+/// [`FfiVault`] immediately instead of reading the key store again, and every
+/// read is another hardware access that prompts for biometrics on some
+/// platforms.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 口令错误返回 [`Error::RecoveryAuthenticationFailed`]（`kind` 为
-/// `recovery_authentication_failed`）；文件结构不对返回
-/// [`Error::RecoveryFileMalformed`]；参数超出范围返回
-/// [`Error::RecoveryParametersInvalid`]。
+/// A wrong passphrase returns [`Error::RecoveryAuthenticationFailed`] (`kind` is
+/// `recovery_authentication_failed`); a malformed file returns
+/// [`Error::RecoveryFileMalformed`]; out-of-range parameters return
+/// [`Error::RecoveryParametersInvalid`].
 ///
-/// **口令错误与文件损坏必须区分**：前者提示用户重新输入，后者要提示文件不可用。
-/// 合并成一条「恢复失败」会让用户反复试口令，而问题根本不在口令上。
+/// **A wrong passphrase and a damaged file must be distinguished**: the first
+/// asks the user to type it again, the second reports that the file is unusable.
 #[uniffi::export]
 pub fn import_recovery_key(
     file: Vec<u8>,
@@ -1398,15 +1498,16 @@ pub fn import_recovery_key(
     Ok(flow::master_key_to_bytes(&master).expose_secret().to_vec())
 }
 
-/// 把一份主密钥写入平台密钥库。
+/// Writes a master key into the platform key store.
 ///
-/// 供端侧在 [`FfiJoiner::complete`] 之后使用：那条路径返回主密钥字节，由端侧决定
-/// 何时落库。单独提供这一步而不是让 `complete` 自己写，是因为「登录完成」与
-/// 「保存密钥」在界面上是两个动作——用户可能在保存前就被要求确认设备名称。
+/// For use by the host side after [`FfiJoiner::complete`], which returns master
+/// key bytes and leaves the timing of the store write to the host side. This is
+/// a separate step rather than something `complete` does itself, because
+/// "login finished" and "key saved" are two actions in a user interface.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 密钥长度不是 32 字节时返回 [`Error::MasterKeyWrongLength`]。
+/// Returns [`Error::MasterKeyWrongLength`] when the key length is not 32 bytes.
 #[uniffi::export]
 pub fn store_master_key(
     master_key: Vec<u8>,
@@ -1418,36 +1519,41 @@ pub fn store_master_key(
     Ok(())
 }
 
-// ── 登录：发起方与加入方 ─────────────────────────────────────────────────
+// ── Login: initiator and joiner ──────────────────────────────────────────
 
-/// 登录的发起方：一台**已经登录**、持有主密钥的设备。
+/// The initiator of a login: a device that is **already logged in** and holds
+/// the master key.
 ///
-/// 它负责显示二维码、接收请求、把主密钥加密交给对方。
+/// It displays the QR code, receives the request and hands the master key to the
+/// other device in encrypted form.
 ///
-/// # 一次登录只服务一个请求
+/// # One login serves exactly one request
 ///
-/// 核心把这个性质做成了**类型强制的**（`authorize` 消费掉待处理的会话），因此
-/// 重复调用第二次必然失败，不需要端侧维护标志位。端侧要做的只是：一个二维码对应
-/// 一个 [`FfiLogin`] 实例，授权成功后把它丢掉。
+/// The core enforces this with the **type system** (`authorize` consumes the
+/// pending session), so a second call necessarily fails and the host side needs
+/// no flag of its own. All the host side does is keep one QR code per
+/// [`FfiLogin`] instance and drop it after a successful authorization.
 ///
-/// # 跨重启的重放防护
+/// # Replay protection across restarts
 ///
-/// 核心的 `Login` 能做的是「同一进程内一次」。要让重放防护跨应用重启存活，需要把
-/// 用过的会话标识持久化、并在下次登录时恢复。**本层没有暴露这条路径**：核心的
-/// `NonceLog` 没有序列化入口，因此跨重启这一层暂时不可达（详见 TODO.md）。
+/// The core's `Login` guarantees single use within one process. Keeping replay
+/// protection across application restarts would require persisting used session
+/// identifiers and restoring them at the next login. **This layer does not expose
+/// that path**: the core's `NonceLog` has no serialization entry point, so
+/// cross-restart protection is presently unreachable.
 ///
-/// 就当前协议而言这不构成缺口——待处理的会话本身也不跨重启存活（它含一次性的临时
-/// 私钥，端侧不可能把它写到磁盘上），因此没有东西可以被重放。真正需要它的是 M4 的
-/// 局域网同步：那时才会有跨会话、跨重启都要拒绝的重放。
+/// That is not a gap for the current protocol: a pending session itself does not
+/// survive a restart (it contains an ephemeral private key that the host side
+/// cannot write to disk), so there is nothing to replay.
 #[derive(uniffi::Object)]
 pub struct FfiLogin {
-    /// 核心的发起方状态。
+    /// The core initiator state.
     inner: std::sync::Mutex<Login>,
 }
 
 #[uniffi::export]
 impl FfiLogin {
-    /// 发起一次登录，返回要显示成二维码的文本。
+    /// Starts a login and returns the text to display as a QR code.
     #[uniffi::constructor]
     pub fn begin() -> Result<Arc<Self>, FfiError> {
         Ok(Arc::new(Self {
@@ -1455,45 +1561,49 @@ impl FfiLogin {
         }))
     }
 
-    /// 要显示成二维码的文本。
+    /// The text to display as a QR code.
     ///
-    /// 这是**唯一**需要展示给对方的信道。它不含主密钥（见核心 `pairing` 的模块
-    /// 文档），但它是这次会话的凭据，因此不要把它发到聊天记录或截图分享——那等于
-    /// 把登录机会交给看到它的人。
+    /// This is the **only** channel that has to be shown to the other device. It
+    /// contains no master key (see the module documentation of the core
+    /// `pairing`), but it is the credential for this session, so it must not be
+    /// sent to a chat log or shared as a screenshot.
     pub fn payload(&self) -> String {
         self.lock().payload().to_base32()
     }
 
-    /// 接受对方扫到二维码后发来的请求，返回要发回去的应答字节。
+    /// Accepts the request the other device sends after scanning the QR code and
+    /// returns the reply bytes to send back.
     ///
-    /// # 授权就是「用户确认」
+    /// # Authorization is user confirmation
     ///
-    /// 本函数一被调用，主密钥就被加密交给对方了。因此端侧**必须**在调用前让用户
-    /// 确认（例如显示「有一台新设备请求登录，是你本人操作吗？」）。核心无法替端侧
-    /// 做这个决定，也不该做。
+    /// The moment this function is called, the master key is encrypted and handed
+    /// to the other device. The host side **must** therefore obtain user
+    /// confirmation before calling it (for example by asking whether the user
+    /// really started a login on a new device). The core cannot make that
+    /// decision for the host side, and should not.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 请求不是本次会话发出的、密文被改过、或本次登录已经授权过，一律返回
-    /// [`Error::PairingAuthenticationFailed`]。**原因刻意不细分**，免得给攻击者一个
-    /// 区分「差一点就成功」的预言机；端侧的文案也应当保持笼统（「配对失败，请重新
-    /// 扫码」而不是「密钥错误」）。
+    /// A request that did not come from this session, tampered ciphertext, and a
+    /// login that has already been authorized all return
+    /// [`Error::PairingAuthenticationFailed`]. **The reason is deliberately not
+    /// split further**, so that an attacker gains no oracle distinguishing "almost
+    /// succeeded"; host-side text should stay generic as well.
     pub fn authorize(&self, vault: Arc<FfiVault>, msg1: Vec<u8>) -> Result<Vec<u8>, FfiError> {
-        // 主密钥从 `FfiVault` 里借出来，**不经过端侧**。这是 `authorize` 收一个
-        // vault 而不是一串字节的原因。
         let vault = vault.lock();
         let mut login = self.lock();
         Ok(login.authorize(&msg1, vault.master_key())?)
     }
 
-    /// 请求方声明的设备标识（授权成功后才有值）。
+    /// The device identifier declared by the requester (a value exists only after
+    /// a successful authorization).
     pub fn joiner_device_id(&self) -> Option<String> {
         self.lock().joiner_device().map(|id| id.to_hex())
     }
 }
 
 impl FfiLogin {
-    /// 取得锁，忽略中毒（理由见 [`FfiVault::lock`]）。
+    /// Takes the lock, ignoring poisoning (see [`FfiVault::lock`]).
     fn lock(&self) -> std::sync::MutexGuard<'_, Login> {
         self.inner
             .lock()
@@ -1501,34 +1611,41 @@ impl FfiLogin {
     }
 }
 
-/// 登录的加入方：一台还没有主密钥的新设备。
+/// The joiner of a login: a new device that does not have the master key yet.
 ///
-/// # 生命周期是「扫码 → 发请求 → 收应答 → 完成」
+/// # The lifecycle is scan → request → reply → complete
 ///
-/// 请求必须由**同一个**对象发出与完成：会话标识由这次的临时密钥决定，换一个对象
-/// 就等于换一次会话，应答必然解不开。核心用类型表达了这一点（`request` 借 `&self`
-/// 而不是消费它，`complete` 才消费），因此端侧只要不重建对象就自然正确。
+/// The request must be issued and completed by the **same** object: the session
+/// identifier is determined by this session's ephemeral key, so a different
+/// object means a different session and the reply cannot be opened. The core
+/// expresses this in the type system (`request` borrows `&self` instead of
+/// consuming it, and only `complete` consumes), so as long as the host side does
+/// not rebuild the object the behavior is right.
 #[derive(uniffi::Object)]
 pub struct FfiJoiner {
-    /// 核心的加入方状态。
+    /// The core joiner state.
     inner: std::sync::Mutex<Joiner>,
 }
 
 #[uniffi::export]
 impl FfiJoiner {
-    /// 用扫到的二维码文本建立会话。`label` 是本机设备身份在平台密钥库里的标签。
+    /// Establishes a session from the scanned QR code text. `label` is the label
+    /// of this device's identity in the platform key store.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 文本不是合法的二维码载荷时返回 [`Error::PairingPayloadMalformed`]。
-    /// 注意「不是合法载荷」与「载荷合法但会话对不上」是两回事，后者要到
-    /// [`FfiJoiner::complete`] 才会暴露。
+    /// Returns [`Error::PairingPayloadMalformed`] when the text is not a valid QR
+    /// payload. Note that "not a valid payload" and "valid payload but a
+    /// mismatched session" are two different things; the latter only surfaces at
+    /// [`FfiJoiner::complete`].
     ///
-    /// # 为什么这里不顺手发请求
+    /// # Why this does not send the request as well
     ///
-    /// 核心的 `new` 与 `request` 是分开的两步，本层保持同样的粒度：发出请求需要
-    /// 设备身份，而取得身份在有的平台上会弹生物识别提示。端侧可能希望先向用户说明
-    /// 「接下来要创建本机密钥」再触发它。合并成一步会让那个提示来得毫无预兆。
+    /// The core keeps `new` and `request` as two steps and this layer keeps the
+    /// same granularity: sending the request needs the device identity, and
+    /// obtaining the identity prompts for biometrics on some platforms. The host
+    /// side may want to tell the user that a local key is about to be created
+    /// before triggering it.
     #[uniffi::constructor]
     pub fn from_qr(text: String, label: String) -> Result<Arc<Self>, FfiError> {
         check_len("qr", &text, MAX_QR_TEXT_CHARS)?;
@@ -1538,48 +1655,59 @@ impl FfiJoiner {
         }))
     }
 
-    /// 要发给发起方的请求字节。**幂等**：重复调用返回同一条消息，不会重新签名。
+    /// The request bytes to send to the initiator. **Idempotent**: repeated calls
+    /// return the same message and do not sign again.
     ///
-    /// 重新签名会生成新的会话标识，让发起方认不出这是同一次登录——因此幂等不是
-    /// 优化，是正确性要求。
+    /// Signing again would produce a new session identifier and the initiator
+    /// would no longer recognize it as the same login, so idempotence is a
+    /// correctness requirement rather than an optimization.
     pub fn request(&self, keys: Arc<dyn FfiDeviceKeys>) -> Result<Vec<u8>, FfiError> {
         let mut keys = ForeignDeviceKeys(keys);
         let mut joiner = self.lock();
         Ok(joiner.request(&mut keys)?)
     }
 
-    /// 本机在这次会话里声明的设备身份（SEC1 未压缩编码，65 字节）。
+    /// The device identity this device declares in this session (SEC1
+    /// uncompressed encoding, 65 bytes).
     ///
-    /// 发起方应当拿它与 [`FfiLogin::joiner_device_id`] 一起显示给用户确认——用户
-    /// 要能看出「请求登录的是不是我想的那台设备」。完成之后返回 `None`。
+    /// The initiator should display it together with
+    /// [`FfiLogin::joiner_device_id`] for the user to confirm, so that the user
+    /// can tell whether the requesting device is the expected one. Returns `None`
+    /// after completion.
     #[must_use]
     pub fn identity(&self) -> Option<Vec<u8>> {
         self.lock().identity().map(|bytes| bytes.to_vec())
     }
 
-    /// 用发起方的应答完成登录：验证应答、取出主密钥、**并写入平台密钥库**。
+    /// Completes the login with the initiator's reply: verifies the reply, takes
+    /// out the master key and **writes it into the platform key store**.
     ///
-    /// 返回主密钥的 32 字节，供端侧立刻构造 [`FfiVault`]（用
-    /// [`FfiVault::from_master_key`]）而不必再从密钥库读一次——多读一次就是多一次
-    /// 硬件访问，而有的平台每次访问都会弹生物识别提示。
+    /// Returns the 32 bytes of the master key so that the host side can build an
+    /// [`FfiVault`] right away with [`FfiVault::from_master_key`] instead of
+    /// reading the key store again; every read is another hardware access that
+    /// prompts for biometrics on some platforms.
     ///
-    /// # 这一步才真正验证应答
+    /// # This is where the reply is actually verified
     ///
-    /// 应答的解密与认证发生在这里，而不是在 [`FfiJoiner::from_qr`]。因此「登录
-    /// 失败」的唯一可信位置是本函数——端侧不要因为在扫码阶段没报错就认为一切正常。
+    /// Decryption and authentication of the reply happen here, not in
+    /// [`FfiJoiner::from_qr`]. A login failure is therefore only trustworthy from
+    /// this function.
     ///
-    /// # 只能用一次
+    /// # Single use
     ///
-    /// 核心的会话是一次性的（`complete` 内部 `take` 掉），因此第二次调用返回
-    /// [`Error::PairingAuthenticationFailed`]，而**不是**与伪造应答不同的错误。
-    /// 这是刻意的：单独报「已经用过了」等于告诉攻击者他的重放被认出来了。
+    /// The core's session is single use (`complete` takes it internally), so a
+    /// second call returns [`Error::PairingAuthenticationFailed`] and **not** a
+    /// different error from a forged reply. Reporting "already used" separately
+    /// would tell an attacker that the replay was detected.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 应答来自另一次会话、密文被改过、发起方用了别的主密钥、或本次登录已经完成过，
-    /// 都返回 [`Error::PairingAuthenticationFailed`]。主密钥写入平台存储失败时返回
-    /// [`Error::SecureStoreWriteFailed`]——此时**主密钥不会留在任何地方**，端侧应当
-    /// 让用户重新走一次登录。
+    /// A reply from another session, tampered ciphertext, an initiator using a
+    /// different master key, and a completed login all return
+    /// [`Error::PairingAuthenticationFailed`]. A failure to write the master key
+    /// into the platform store returns [`Error::SecureStoreWriteFailed`]; in that
+    /// case **the master key is left nowhere** and the host side should have the
+    /// user log in again.
     pub fn complete(
         &self,
         msg2: Vec<u8>,
@@ -1594,7 +1722,7 @@ impl FfiJoiner {
 }
 
 impl FfiJoiner {
-    /// 取得锁，忽略中毒（理由见 [`FfiVault::lock`]）。
+    /// Takes the lock, ignoring poisoning (see [`FfiVault::lock`]).
     fn lock(&self) -> std::sync::MutexGuard<'_, Joiner> {
         self.inner
             .lock()
@@ -1602,48 +1730,58 @@ impl FfiJoiner {
     }
 }
 
-// ── 挑战-应答：证明持有主密钥（D3） ──────────────────────────────────────
+// ── Challenge-response: proving possession of the master key ─────────────
 //
-// 这一节有**两条消息**，方向与我们平时说的「请求/应答」相反：
+// This section has **three messages**, and their direction is the opposite of
+// the usual "request/response":
 //
-// 1. 验证方 → 应答方：挑战（`FfiVerifier::challenge` → `FfiResponder::accept`）
-// 2. 应答方 → 验证方：应答（`FfiResponder::respond` → `FfiVerifier::verify`）
-// 3. 验证方 → 应答方：确认标签（`FfiVerifier::session_id`/`confirmation` →
-//    `FfiResponder::confirm`）
+// 1. verifier → responder: the challenge (`FfiVerifier::challenge` →
+//    `FfiResponder::accept`)
+// 2. responder → verifier: the response (`FfiResponder::respond` →
+//    `FfiVerifier::verify`)
+// 3. verifier → responder: the confirmation tag (`FfiVerifier::session_id` and
+//    `FfiVerifier::confirmation` → `FfiResponder::confirm`)
 //
-// 第三步容易被漏掉，而它是**反过来**的证明：应答方据此确认「回话的确实是刚才那个
-// 验证方」。只做前两步时，任何人都可以先发一个挑战再假装自己验证通过了。
+// The third step is easy to omit, and it is the proof in the **opposite**
+// direction: the responder uses it to confirm that the party answering really
+// is the verifier that sent the challenge. With only the first two steps,
+// anyone can send a challenge and then pretend to have verified it.
 
-/// 验证方：要确认对方手里确实有主密钥。
+/// The verifier: confirms that the other side actually holds the master key.
 ///
-/// # 它用在什么场景
+/// # Where it is used
 ///
-/// 1. **确认解锁成功**。版本 2 的保险库文件本身就能判定主密钥对错（见
-///    [`FfiVault::open`]），因此这条路径主要服务于**版本 1 的旧文件**，以及
-///    「手里只有主密钥、还没有文件」的情形。
-/// 2. **跨设备的身份确认**（后续里程碑）。它与文件内容无关，因此在文件缺失或
-///    损坏时是唯一可用的证明手段。
+/// 1. **Confirming a successful unlock.** A version 2 vault file already tells
+///    whether the master key is right (see [`FfiVault::open`]), so this path
+///    mainly serves **old version 1 files** and the case of having only a master
+///    key and no file yet.
+/// 2. **Cross-device identity confirmation.** It does not depend on file
+///    content, so it is the only proof available when the file is missing or
+///    damaged.
 ///
-/// # 与配对的区别
+/// # Difference from pairing
 ///
-/// 配对是「把主密钥交给对方」；挑战-应答是「证明我手里有主密钥，但不交出去」。
-/// 前者只在登录时发生一次，后者可以随时发生。**不要把挑战-应答当成登录**：它不
-/// 传输任何密钥。
+/// Pairing hands the master key to the other side; challenge-response proves
+/// possession of the master key without handing it over. The former happens once
+/// at login, the latter at any time. **Challenge-response is not login**: it
+/// transfers no key.
 #[derive(uniffi::Object)]
 pub struct FfiVerifier {
-    /// 核心的验证方状态。`verify` 消费它，因此是 `Option`。
+    /// The core verifier state. `verify` consumes it, hence the `Option`.
     inner: std::sync::Mutex<Option<auth::Verifier>>,
-    /// 第一步要发出去的挑战字节。
+    /// The challenge bytes to send in the first step.
     challenge: Vec<u8>,
-    /// 第二步之后算出来的会话标识，第三步要回传给对方。
+    /// The session identifier computed after the second step, sent back to the
+    /// other side in the third step.
     session_id: std::sync::Mutex<Option<[u8; AUTH_SESSION_ID_LEN]>>,
-    /// 第二步之后算出来的确认标签，第三步要回传给对方。
+    /// The confirmation tag computed after the second step, sent back to the
+    /// other side in the third step.
     confirmation: std::sync::Mutex<Option<[u8; AUTH_CONFIRM_LEN]>>,
 }
 
 #[uniffi::export]
 impl FfiVerifier {
-    /// 发起一次挑战。
+    /// Starts a challenge.
     #[uniffi::constructor]
     pub fn begin() -> Result<Arc<Self>, FfiError> {
         let (challenge, verifier) = auth::begin()?;
@@ -1655,28 +1793,32 @@ impl FfiVerifier {
         }))
     }
 
-    /// 要发给对方的挑战字节。
+    /// The challenge bytes to send to the other side.
     #[must_use]
     pub fn challenge(&self) -> Vec<u8> {
         self.challenge.clone()
     }
 
-    /// 校验对方的应答，成功返回 `true`。
+    /// Verifies the other side's response and returns `true` on success.
     ///
-    /// 失败返回 [`Error::AuthProofFailed`]（`kind` 为 `auth_proof_failed`），**不要**
-    /// 把它当成「主密钥错了」以外的意思：这个错误只在标签对不上时产生。
+    /// Failure returns [`Error::AuthProofFailed`] (`kind` is `auth_proof_failed`);
+    /// **do not** read anything else into it: this error is produced only when a
+    /// tag does not match.
     ///
-    /// # 只能用一次
+    /// # Single use
     ///
-    /// 挑战是一次性的（核心的 `verify` 消费 `self`）。重复校验返回
-    /// [`Error::AuthProofFailed`]——与「应答是伪造的」同一个错误，理由同
-    /// [`FfiJoiner::complete`]：不给重放者一个区分信号。
+    /// The challenge is single use (the core's `verify` consumes `self`). A
+    /// repeated verification returns [`Error::AuthProofFailed`] — the same error
+    /// as a forged response, for the reason given at [`FfiJoiner::complete`]: no
+    /// distinguishing signal for a replayer.
     ///
-    /// # 成功之后还要做第三步
+    /// # The third step follows a success
     ///
-    /// 拿到 `true` 之后，端侧必须把 [`FfiVerifier::session_id`] 与
-    /// [`FfiVerifier::confirmation`] 回传给对方，由对方调 [`FfiResponder::confirm`]
-    /// 校验。**漏掉第三步等于只做了一半认证**：应答方无从确认回话的是不是真的验证方。
+    /// After receiving `true`, the host side must send
+    /// [`FfiVerifier::session_id`] and [`FfiVerifier::confirmation`] back to the
+    /// other side, which verifies them with [`FfiResponder::confirm`]. **Omitting
+    /// the third step leaves the authentication half done**: the responder has no
+    /// way to confirm that the party answering really is the verifier.
     pub fn verify(&self, response: Vec<u8>, vault: Arc<FfiVault>) -> Result<bool, FfiError> {
         let verifier = {
             let mut guard = self
@@ -1698,7 +1840,8 @@ impl FfiVerifier {
         Ok(true)
     }
 
-    /// 第三步要回传给对方的会话标识。校验成功之前为 `None`。
+    /// The session identifier to send back in the third step. `None` before a
+    /// successful verification.
     #[must_use]
     pub fn session_id(&self) -> Option<Vec<u8>> {
         self.session_id
@@ -1707,7 +1850,8 @@ impl FfiVerifier {
             .map(|id| id.to_vec())
     }
 
-    /// 第三步要回传给对方的确认标签。校验成功之前为 `None`。
+    /// The confirmation tag to send back in the third step. `None` before a
+    /// successful verification.
     #[must_use]
     pub fn confirmation(&self) -> Option<Vec<u8>> {
         self.confirmation
@@ -1717,21 +1861,21 @@ impl FfiVerifier {
     }
 }
 
-/// 应答方：手里有主密钥，要向验证方证明这一点。
+/// The responder: holds the master key and proves it to the verifier.
 #[derive(uniffi::Object)]
 pub struct FfiResponder {
-    /// 核心的应答方状态。
+    /// The core responder state.
     inner: std::sync::Mutex<auth::Responder>,
 }
 
 #[uniffi::export]
 impl FfiResponder {
-    /// 接受对方发来的挑战。
+    /// Accepts a challenge sent by the other side.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 挑战格式不对（长度、版本、临时公钥不在曲线上）时返回
-    /// [`Error::AuthMessageMalformed`]。
+    /// Returns [`Error::AuthMessageMalformed`] when the challenge is malformed
+    /// (length, version, or an ephemeral public key that is not on the curve).
     #[uniffi::constructor]
     pub fn accept(challenge: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         Ok(Arc::new(Self {
@@ -1739,16 +1883,19 @@ impl FfiResponder {
         }))
     }
 
-    /// 本机在这次会话里的设备身份（SEC1 未压缩编码，65 字节）。
+    /// The device identity this device uses in this session (SEC1 uncompressed
+    /// encoding, 65 bytes).
     #[must_use]
     pub fn identity(&self) -> Vec<u8> {
         self.lock().public_key().to_vec()
     }
 
-    /// 生成应答，交给验证方。
+    /// Produces the response to hand to the verifier.
     ///
-    /// 签名走 [`FfiDeviceKeys::sign`]，**传进去的是原始消息**；端侧实现不得先做
-    /// 哈希（那样会与核心的验签路径叠加成「哈希两次」，每次校验都失败）。
+    /// Signing goes through [`FfiDeviceKeys::sign`] and **receives the raw
+    /// message**; the host-side implementation must not hash it first, since the
+    /// core verifies with the standard ECDSA hash mode and hashing twice makes
+    /// every verification fail.
     pub fn respond(
         &self,
         vault: Arc<FfiVault>,
@@ -1760,9 +1907,6 @@ impl FfiResponder {
         let responder = self.lock();
         let mut keys = ForeignDeviceKeys(keys);
         let device = keys.get_or_create(&label)?;
-        // 注意签名回调收的是**原始消息**：核心的验签路径用标准 ECDSA 哈希模式，
-        // 若这里先哈希再签，验签方会再哈希一次，结果是每次都报
-        // `DeviceSignatureInvalid`，而密钥与消息看上去全对。
         let response =
             responder.respond(vault.master_key(), device.as_sec1_bytes(), |message| {
                 keys.sign(&label, message)
@@ -1770,15 +1914,17 @@ impl FfiResponder {
         Ok(response)
     }
 
-    /// 校验验证方回传的确认标签（第三步）。
+    /// Verifies the confirmation tag sent back by the verifier (the third step).
     ///
-    /// 成功返回 `true`。**这一步不能省**：它证明对方确实算得出会话密钥，而不只是
-    /// 转发了一条挑战。
+    /// Returns `true` on success. **This step must not be skipped**: it proves
+    /// that the other side can actually compute the session key rather than only
+    /// forwarding a challenge.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 标签不匹配或会话标识对不上时返回 [`Error::AuthProofFailed`]；标签长度不对
-    /// 返回 [`Error::AuthMessageMalformed`]。
+    /// Returns [`Error::AuthProofFailed`] when the tag does not match or the
+    /// session identifier does not match, and [`Error::AuthMessageMalformed`]
+    /// when the tag length is wrong.
     pub fn confirm(
         &self,
         vault: Arc<FfiVault>,
@@ -1800,7 +1946,7 @@ impl FfiResponder {
 }
 
 impl FfiResponder {
-    /// 取得锁，忽略中毒。
+    /// Takes the lock, ignoring poisoning.
     fn lock(&self) -> std::sync::MutexGuard<'_, auth::Responder> {
         self.inner
             .lock()
@@ -1808,17 +1954,21 @@ impl FfiResponder {
     }
 }
 
+/// Builds [`KdfParams`] from the optional host-side values.
 ///
-/// # 为什么参数从端侧来、却又必须在这里校验范围
+/// # Why the values come from the host side yet are range-checked here
 ///
-/// 参数确实来自端侧（用户可以在界面上调），但**也来自别人的文件**：导入时
-/// 参数是从文件里读出来的，而文件是攻击者可控的。核心的 `KdfParams::new`
-/// 两头都设了上下界，这里直接把它的错误透传出去，不自己判断——判断只有一份实现，
-/// 才不会出现「FFI 放过了、核心又拒绝」这类不一致。
+/// They do come from the host side (the user can adjust them in the user
+/// interface), but they **also come from someone else's file**: on import the
+/// values are read from a file, and that file is attacker controlled. The core's
+/// `KdfParams::new` bounds both ends, and this function passes its error through
+/// instead of judging on its own, so that there is only one implementation of the
+/// check.
 ///
-/// 端侧传 `u64` 而不是核心的 `u32`：UniFFI 对 `u32` 的映射在 Kotlin 侧是无符号
-/// 类型，而 Kotlin 没有原生无符号整数，端侧要额外绕。`u64` 在两侧都是自然的。
-/// 超出 `u32` 的值会在核心的范围检查里被拒绝，不会静默截断。
+/// The host side passes `u64` rather than the core's `u32`: UniFFI maps `u32` to
+/// an unsigned type on the Kotlin side, which Kotlin does not have natively. A
+/// value above `u32` is rejected by the core's range check and is never silently
+/// truncated.
 fn kdf_params(
     memory_kib: Option<u64>,
     iterations: Option<u64>,
@@ -1855,8 +2005,6 @@ mod tests {
 
     #[test]
     fn rfc6238_vector_survives_the_ffi_boundary() {
-        // RFC 6238 附录 B：SHA-1 / 20 字节种子 "12345678901234567890"
-        // 在 59 秒处应为 94287082。
         let code = totp_code(
             RFC_SECRET.to_owned(),
             59,
@@ -1902,9 +2050,7 @@ mod tests {
 
     #[test]
     fn length_limit_counts_characters_not_bytes() {
-        // 2048 个中文字符 = 6144 字节，但按字符计未超限，不应被边界拒绝。
         let chinese = "中".repeat(MAX_SECRET_CHARS);
-        // 它不是合法 Base32，所以会走到核心解析并失败——关键是**不是** InputTooLong。
         match secret_byte_len(chinese) {
             Err(FfiError::InputTooLong { .. }) => panic!("按字符计不该触发上限"),
             Err(FfiError::Core { .. }) => {}
@@ -1914,7 +2060,6 @@ mod tests {
 
     #[test]
     fn hotp_matches_rfc4226_through_ffi() {
-        // RFC 4226 附录 D 前四组。
         let expected = ["755224", "287082", "359152", "969429"];
         for (counter, want) in expected.iter().enumerate() {
             let got = hotp_code(
@@ -1938,7 +2083,6 @@ mod tests {
             FfiDigits::Eight,
         )
         .expect("应能计算");
-        // 当前步应命中并返回 0。59/30 = 1。
         let hit = verify_code_with_drift(
             RFC_SECRET.to_owned(),
             1,
@@ -1950,7 +2094,6 @@ mod tests {
         .expect("应能校验");
         assert_eq!(hit, Some(0));
 
-        // 落后一步（用 89 秒即 counter=2 的码去对 counter=1）应返回 1。
         let next = totp_code(
             RFC_SECRET.to_owned(),
             89,
@@ -1997,26 +2140,26 @@ mod tests {
         );
     }
 
-    // ── M3：注册、登录、恢复、挑战-应答 ──────────────────────────────
+    // ── Registration, login, recovery, challenge-response ────────────
 
-    /// 测试用的设备身份：密钥由标签确定性地导出。
+    /// A device identity for tests: keys are derived deterministically from the
+    /// label.
     ///
-    /// 确定性的用意是让「同一台设备」在多次调用间保持一致——真实平台密钥库也是
-    /// 这样的（同一个标签取回同一把密钥）。用真随机数会让「用同一个 label 重新
-    /// 取一次应当拿到同一把」这条性质无法验证。
+    /// Determinism keeps "the same device" consistent between calls, as a real
+    /// platform key store does (the same label returns the same key). With true
+    /// randomness, the property "getting the same label again returns the same
+    /// key" could not be verified.
     #[derive(Default)]
     struct TestKeys {
         keys: std::sync::Mutex<std::collections::HashMap<String, p256::ecdsa::SigningKey>>,
     }
 
     impl TestKeys {
-        /// 取回或创建标签对应的签名密钥。
+        /// Returns or creates the signing key for a label.
         fn key_for(&self, label: &str) -> p256::ecdsa::SigningKey {
             let mut keys = self.keys.lock().expect("测试中无并发中毒");
             keys.entry(label.to_owned())
                 .or_insert_with(|| {
-                    // 由标签导出确定性的标量。这里**只是为了让测试可复现**，不是
-                    // 密钥派生方案——真实实现必须用平台密钥库。
                     let scalar = sha2::Digest::finalize({
                         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
                         sha2::Digest::update(&mut hasher, label.as_bytes());
@@ -2042,7 +2185,7 @@ mod tests {
         }
     }
 
-    /// 测试用的平台密钥库：把主密钥放在内存里。
+    /// A platform key store for tests: keeps the master key in memory.
     #[derive(Default)]
     struct TestStore {
         master: std::sync::Mutex<Option<Vec<u8>>>,
@@ -2064,13 +2207,11 @@ mod tests {
         }
 
         fn is_hardware_backed(&self) -> bool {
-            // 如实上报。谎报成 `true` 会让依赖它的分支走进与生产不同的路径，
-            // 而测试就再也不会覆盖到软件密钥那条。
             false
         }
     }
 
-    /// 一个最小可用的条目。
+    /// A minimal usable entry.
     fn sample_entry(name: &str) -> FfiVaultEntry {
         FfiVaultEntry {
             id: String::new(),
@@ -2090,14 +2231,16 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000;
 
-    /// **空的**保险库也必须能判定主密钥对错。
+    /// An **empty** vault must also tell whether the master key is right.
     ///
-    /// 这条覆盖的正是格式版本 2 修掉的那个缺口：版本 1 里主密钥只参与每条记录的
-    /// AEAD，而空文件没有记录，于是任何 32 字节密钥都能打开它，界面会显示「已解锁」
-    /// 而密钥其实是错的。
+    /// This covers the gap that format version 2 closes: in version 1 the master
+    /// key only took part in the AEAD of each record, and an empty file has no
+    /// records, so any 32-byte key opened it and the user interface showed
+    /// "unlocked" for a wrong key.
     ///
-    /// 端侧看到的现象是：`FfiVault.open` 在**一个条目都没有**的文件上也会拒绝错误的
-    /// 主密钥。因此端侧可以把「打开成功」直接当成「已解锁」，不必再补一次挑战-应答。
+    /// The observable behavior for the host side is that `FfiVault.open` rejects a
+    /// wrong master key even for a file with **no entries at all**, so "the open
+    /// succeeded" can be taken as "unlocked" directly.
     #[test]
     fn an_empty_vault_rejects_a_wrong_master_key() {
         let store_a = Arc::new(TestStore::default());
@@ -2110,7 +2253,6 @@ mod tests {
         assert!(vault_a.is_empty(), "前提：这个保险库确实是空的");
         let data = vault_a.serialize().expect("应当能序列化");
 
-        // 另一台设备，有它自己的一把主密钥。
         let store_b = Arc::new(TestStore::default());
         FfiVault::register(
             Arc::new(TestKeys::default()),
@@ -2119,9 +2261,6 @@ mod tests {
         )
         .expect("注册应当成功");
 
-        // 用 `err()` 而不是 `expect_err`：后者要求 `Ok` 一侧也实现 `Debug`，而
-        // `FfiVault` 刻意不实现它——它的内部只有主密钥与条目，一个打印出来的
-        // `Debug` 输出很容易把秘密材料带进日志。
         let error = FfiVault::open(store_b, data)
             .err()
             .expect("空保险库用错误密钥必须被拒");
@@ -2132,9 +2271,11 @@ mod tests {
         );
     }
 
-    /// 注册之后能加条目、能算验证码、能序列化再打开。
+    /// A registered vault accepts entries, computes codes, and can be serialized
+    /// and opened again.
     ///
-    /// 这条走的是端侧最常走的那条路：注册 → 加条目 → 落盘 → 重新打开 → 读验证码。
+    /// This follows the most common host-side path: register → add entry →
+    /// persist → reopen → read a code.
     #[test]
     fn a_registered_vault_roundtrips_through_the_boundary() {
         let keys = Arc::new(TestKeys::default());
@@ -2161,10 +2302,12 @@ mod tests {
         );
     }
 
-    /// 修改条目不能换掉标识，也不能留下墓碑。
+    /// Updating an entry must not change its identifier and must not leave a
+    /// tombstone.
     ///
-    /// 换标识会被同步读成「删了一条、又加了一条」；留墓碑会被读成「这条被删了」。
-    /// 两种都会在另一台设备上造成可见的错误，而本机看起来一切正常。
+    /// A changed identifier reads as one deletion plus one insertion during sync,
+    /// and a tombstone reads as "this entry was deleted"; both cause a visible
+    /// error on another device.
     #[test]
     fn updating_an_entry_keeps_its_id_and_leaves_no_tombstone() {
         let keys = Arc::new(TestKeys::default());
@@ -2187,10 +2330,11 @@ mod tests {
         assert_eq!(entry.created_at, NOW, "创建时间应当被保留");
     }
 
-    /// 指定一个不存在的标识时，修改与删除必须**分别**报告。
+    /// A **nonexistent** identifier must be reported separately by update and by
+    /// removal.
     ///
-    /// 合并处理会让界面在「这条已经不在了」时显示一个空列表，而用户刚才明明还在
-    /// 看条目。
+    /// Collapsing the two would show an empty list where the user was just
+    /// looking at an entry.
     #[test]
     fn a_missing_entry_id_is_reported_as_not_found() {
         let keys = Arc::new(TestKeys::default());
@@ -2204,8 +2348,6 @@ mod tests {
             .expect_err("不存在的标识应当报错");
         assert_eq!(error.kind(), "vault_entry_not_found");
 
-        // 删除一条不存在的条目返回 `false`，不是错误：删除是幂等的，重复删除
-        // （例如界面上点了两次）不该弹出错误。
         assert!(
             !vault.remove_entry("0".repeat(32), NOW).expect("应当能调用"),
             "删除不存在的条目应当返回 false"
@@ -2213,10 +2355,11 @@ mod tests {
         assert_eq!(vault.entry_count(), 0);
     }
 
-    /// 登录把主密钥原样交给新设备，新设备因此能打开老设备的保险库。
+    /// Logging in hands the master key to the new device unchanged, so the new
+    /// device can open the old device's vault.
     ///
-    /// 只断言「没有报错」是不够的：一个把主密钥换成新随机值的实现同样不报错，
-    /// 而用户要到同步时才发现条目一条都对不上。
+    /// Asserting only "no error" is not enough: an implementation that replaced
+    /// the master key with a fresh random value reports no error either.
     #[test]
     fn login_transfers_the_master_key_across_the_boundary() {
         let old_keys = Arc::new(TestKeys::default());
@@ -2229,18 +2372,14 @@ mod tests {
             .expect("应当能添加条目");
         let data = old_vault.serialize().expect("应当能序列化");
 
-        // 老设备出示二维码。
         let login = FfiLogin::begin().expect("应当能开始登录");
-        // 新设备扫码、发请求。
         let joiner_keys = Arc::new(TestKeys::default());
         let joiner =
             FfiJoiner::from_qr(login.payload(), "device-b".to_owned()).expect("应当能建立会话");
         let request = joiner.request(joiner_keys.clone()).expect("应当能发出请求");
-        // 老设备授权（真实界面在这里要用户确认）。
         let reply = login
             .authorize(old_vault.clone(), request)
             .expect("应当能授权");
-        // 新设备完成。
         let joiner_store = Arc::new(TestStore::default());
         let master = joiner
             .complete(reply, joiner_keys, joiner_store.clone())
@@ -2252,12 +2391,12 @@ mod tests {
             "主密钥必须已经写入新设备的平台存储"
         );
 
-        // 关键断言：新设备用自己拿到的密钥能打开老设备的文件。
         let new_vault = FfiVault::open(joiner_store, data).expect("新设备应当能打开老设备的保险库");
         assert_eq!(new_vault.entry_count(), 1, "老设备的那一条应当可见");
     }
 
-    /// 一次登录只能完成一次，且第二次与「伪造应答」报同一个错。
+    /// A login can be completed only once, and the second attempt reports the
+    /// same error as a forged reply.
     #[test]
     fn a_login_cannot_be_completed_twice_across_the_boundary() {
         let old_keys = Arc::new(TestKeys::default());
@@ -2285,7 +2424,7 @@ mod tests {
         );
     }
 
-    /// 恢复密钥文件能取回同一把主密钥。
+    /// A recovery key file restores the same master key.
     #[test]
     fn a_recovery_file_restores_the_same_master_key() {
         let keys = Arc::new(TestKeys::default());
@@ -2296,8 +2435,6 @@ mod tests {
             .expect("应当能添加条目");
         let data = vault.serialize().expect("应当能序列化");
 
-        // 用偏小的参数：这条测试关心的是往返正确性，不是抗暴力破解强度。
-        // 推荐参数（64 MiB）会让每次 `cargo test` 多花几百毫秒。
         let file = vault
             .export_recovery_key("correct horse".to_owned(), Some(8), Some(1), Some(1))
             .expect("应当能导出");
@@ -2308,11 +2445,9 @@ mod tests {
                 .expect("应当能导入");
         assert_eq!(restored.len(), 32);
 
-        // 恢复出来的密钥必须真的能打开原文件。
         let reopened = FfiVault::open(new_store, data).expect("应当能打开");
         assert_eq!(reopened.entry_count(), 1);
 
-        // 口令错误必须与文件损坏区分：前者提示重新输入，后者要提示文件不可用。
         let wrong = import_recovery_key(
             file,
             "wrong passphrase".to_owned(),
@@ -2322,7 +2457,8 @@ mod tests {
         assert_eq!(wrong.kind(), "recovery_authentication_failed");
     }
 
-    /// 挑战-应答的三步都要能走通，且主密钥不出边界。
+    /// All three steps of the challenge-response must work, with the master key
+    /// staying inside the boundary.
     #[test]
     fn challenge_response_confirms_both_sides_across_the_boundary() {
         let keys = Arc::new(TestKeys::default());
@@ -2343,7 +2479,6 @@ mod tests {
             "第二步应当通过"
         );
 
-        // 第三步：确认标签回传，应答方据此确认对方算得出会话密钥。
         let session_id = verifier.session_id().expect("校验之后应当有会话标识");
         let confirmation = verifier.confirmation().expect("校验之后应当有确认标签");
         assert!(
@@ -2354,7 +2489,7 @@ mod tests {
         );
     }
 
-    /// 挑战-应答与配对一样是一次性的。
+    /// Challenge-response is single use, like pairing.
     #[test]
     fn a_challenge_cannot_be_verified_twice() {
         let keys = Arc::new(TestKeys::default());
@@ -2376,11 +2511,12 @@ mod tests {
         assert_eq!(error.kind(), "auth_proof_failed");
     }
 
-    /// 每一类错误都有独一无二的 kind，且没有一类落进 `"unknown"`。
+    /// Every kind is unique, and none of them falls into `"unknown"`.
     ///
-    /// `core_error_kind` 末尾有一个 `_ => "unknown"` 兜底（核心的 `Error` 标了
-    /// `non_exhaustive`，必须有这一支）。因此**新增核心变体时编译器不会提醒**——
-    /// 这条测试就是那个提醒：漏掉映射的变体会在这里显示成 `"unknown"`。
+    /// `core_error_kind` ends with a `_ => "unknown"` fallback (the core `Error` is
+    /// marked `non_exhaustive`, so that arm is required). The compiler therefore
+    /// **does not warn about a newly added core variant**; this test is the
+    /// reminder: a variant missing from the mapping shows up here as `"unknown"`.
     #[test]
     fn every_mapped_error_kind_is_distinct_and_known() {
         let kinds = [
