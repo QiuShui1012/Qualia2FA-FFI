@@ -58,7 +58,8 @@ uniffi::setup_scaffolding!();
 
 use std::sync::Arc;
 
-use qualia_dik::{DevicePublicKey, DeviceSignature};
+use qualia_dik::keystore::PlatformKeyStore;
+use qualia_dik::{DeviceKeyStore, DevicePublicKey, DeviceSignature, DeviceSigner};
 use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
@@ -895,6 +896,229 @@ fn kind_to_core_error(kind: &str) -> Error {
         },
         _ => Error::DeviceKeyMissing,
     }
+}
+
+/// The device identity key store of the current platform, exported to the host
+/// side.
+///
+/// # What this object is for
+///
+/// [`FfiDeviceKeys`] is a **foreign** trait: the host side implements it. The
+/// implementation that really exists — create a P-256 key inside the platform
+/// key store, read its public key, sign with it — lives in `qualia-dik`, so a
+/// host-side implementation of that trait would only forward. This object is
+/// that forwarding, written once in Rust: the host side calls the methods below
+/// and writes no key-store code of its own.
+///
+/// # Contract: the byte formats of [`FfiDeviceKeys`]
+///
+/// - [`FfiPlatformKeys::device_public_key`] returns the 65-byte SEC1
+///   uncompressed point `0x04 || X(32) || Y(32)`, the encoding
+///   [`FfiDeviceKeys::get_or_create`] has to return.
+/// - [`FfiPlatformKeys::sign`] takes the **raw message** and returns the 64-byte
+///   raw `r‖s`, the convention [`FfiDeviceKeys::sign`] has to follow.
+///
+/// # The backend is reported as it is
+///
+/// [`FfiPlatformKeys::backend`] and [`FfiPlatformKeys::is_hardware_backed`]
+/// report the backend **actually in use**. Opening prefers the TPM and falls back
+/// to the operating system software key store only when there is no TPM, and the
+/// fallback stays visible: such a machine reports `"software"` and `false`.
+/// Reporting a software key as hardware-protected would tell the user that a
+/// private key which can be copied off the disk is held by hardware.
+///
+/// # No signer is kept between calls
+///
+/// `qualia-dik` hands out a signer as `Box<dyn DeviceSigner>`, and that trait is
+/// neither `Send` nor `Sync`: a platform key handle is not thread safe, and the
+/// library's Windows backend documents the intended pattern as one handle per
+/// thread rather than one handle shared between threads. A UniFFI object must be
+/// `Send + Sync`, so no handle is stored here. Every method opens the identity
+/// under this object's label again, which is the pattern the platform backend
+/// asks for; the label itself is created once, by [`FfiPlatformKeys::open`].
+///
+/// # This type does not implement `Debug`
+///
+/// Deriving it would delegate to the key store's own `Debug`, whose output is an
+/// implementation detail rather than part of this interface, and the object sits
+/// next to platform key material. Nothing in this crate needs it.
+///
+/// # Current state
+///
+/// Windows is the only platform with a backend implementation. On every other
+/// platform [`FfiPlatformKeys::open`] fails with an error naming that platform;
+/// there is **no** fallback to a software key.
+#[derive(uniffi::Object)]
+pub struct FfiPlatformKeys {
+    /// Key store of the current platform, opened on the best available backend.
+    store: PlatformKeyStore,
+    /// Label of the device identity this object manages.
+    label: String,
+}
+
+#[uniffi::export]
+impl FfiPlatformKeys {
+    /// Opens the best available platform backend and the identity stored under
+    /// `label`, creating that identity when it does not exist yet.
+    ///
+    /// "Best available" is the platform's choice, not this layer's: on Windows
+    /// the TPM 2.0 provider is preferred and the software key store is used only
+    /// when no TPM is available. Which one was chosen is reported by
+    /// [`FfiPlatformKeys::backend`], so the host side can tell the user before
+    /// relying on the identity.
+    ///
+    /// # One label is one identity for the lifetime of the device
+    ///
+    /// The label is the only handle the platform key store has, so opening the
+    /// same label again returns the same identity and never creates a second key.
+    ///
+    /// # The signer handle returned by the key store is dropped
+    ///
+    /// Creating the identity is what this call is for; see [`FfiPlatformKeys`]
+    /// for why the platform handle is not kept between calls.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] when the label is longer than the boundary
+    /// limit; otherwise a [`FfiError::Core`] error: this machine has no usable
+    /// platform key store, this platform has no backend yet, the platform rejects
+    /// the label, or the platform refuses the operation. The key store failures
+    /// carry the kind `device_error`.
+    #[uniffi::constructor]
+    pub fn open(label: String) -> Result<Arc<Self>, FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        let store = open_platform_key_store()?;
+        store.open_or_create(&label).map_err(platform_error)?;
+        Ok(Arc::new(Self { store, label }))
+    }
+
+    /// The SEC1 uncompressed public key of the identity under this object's
+    /// label: 65 bytes, `0x04 || X(32) || Y(32)`.
+    ///
+    /// The same key [`FfiDeviceKeys::get_or_create`] has to return for that
+    /// label, because both name one platform identity. A public key is not a
+    /// secret: it is propagated to peer devices and shown in QR codes.
+    ///
+    /// # Errors
+    ///
+    /// A [`FfiError::Core`] error when the identity cannot be opened: it was
+    /// deleted, this is a different user account, or no key store is available.
+    pub fn device_public_key(&self) -> Result<Vec<u8>, FfiError> {
+        let signer = self.signer()?;
+        Ok(signer.public_key().as_sec1_bytes().to_vec())
+    }
+
+    /// Signs the **raw message** with the identity under this object's label and
+    /// returns the 64-byte raw `r‖s`.
+    ///
+    /// # Do not hash the message first
+    ///
+    /// The platform hashes with SHA-256 internally and the core verifies with the
+    /// standard ECDSA hash mode, so a digest passed in here would be hashed a
+    /// second time and every verification would report `device_signature_invalid`
+    /// while both the key and the message are correct.
+    ///
+    /// # The return value is not DER
+    ///
+    /// It is the fixed 64-byte `r‖s` layout the protocol uses. DER is variable
+    /// length (68 to 72 bytes, depending on leading zero padding), which would
+    /// reveal the high bytes of `r` and `s` and give one mathematical signature
+    /// several valid encodings.
+    ///
+    /// # Errors
+    ///
+    /// A [`FfiError::Core`] error (`device_error`) when the platform refuses to
+    /// sign — a cancelled authentication prompt, for example — or the identity
+    /// cannot be opened.
+    pub fn sign(&self, message: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+        let signer = self.signer()?;
+        let signature = signer.sign(&message).map_err(platform_error)?;
+        Ok(signature.as_bytes().to_vec())
+    }
+
+    /// The backend that holds this identity, as a stable short name: `"tpm"`,
+    /// `"secure-enclave"`, `"android-keystore"`, `"software"` or
+    /// `"unavailable"`.
+    ///
+    /// The value comes from the key store rather than from a signer, so asking
+    /// for it opens no key handle. It is reported **truthfully** and may be
+    /// weaker than what the platform could provide: a Windows machine without a
+    /// TPM reports `"software"`, which means the private key is an ordinary
+    /// operating system key store entry. An identity that opened successfully
+    /// reports `"tpm"` or `"software"` today, since Windows is the only platform
+    /// with a backend.
+    #[must_use]
+    pub fn backend(&self) -> String {
+        self.store.backend().as_str().to_owned()
+    }
+
+    /// Whether the private key of this identity cannot leave hardware.
+    ///
+    /// Consistent with [`FfiPlatformKeys::backend`] by construction: `true`
+    /// exactly when that backend is a hardware one. With `"software"` the key can
+    /// be taken by an attacker who has administrator rights or disk access, so
+    /// the host side has to tell the user before a critical operation.
+    #[must_use]
+    pub fn is_hardware_backed(&self) -> bool {
+        self.store.backend().is_hardware_backed()
+    }
+}
+
+/// Helpers of [`FfiPlatformKeys`] that are **not** exported.
+///
+/// A separate `impl` block on purpose: `#[uniffi::export]` processes every method
+/// of the block it is attached to, including private ones, and it cannot generate
+/// cross-boundary code for a Rust-only type such as `Box<dyn DeviceSigner>`.
+impl FfiPlatformKeys {
+    /// Opens the identity stored under this object's label.
+    ///
+    /// Written in fully qualified form rather than as a method call: the Windows
+    /// backend has an **inherent** `open(preferred: WindowsProvider)`
+    /// constructor, and an inherent method of that name wins method resolution
+    /// and then fails on the argument type. Fully qualified syntax names the
+    /// trait method on every platform.
+    fn signer(&self) -> Result<Box<dyn DeviceSigner>, FfiError> {
+        DeviceKeyStore::open(&self.store, &self.label).map_err(platform_error)
+    }
+}
+
+/// Opens the platform key store on the best backend this machine has.
+///
+/// # Why one `cfg` appears here
+///
+/// The two constructors differ **on purpose**: opening a provider on Windows can
+/// fail — no TPM, disabled by group policy, key store held by another process —
+/// and returns a `Result`, while the placeholder compiled on every other platform
+/// cannot fail and returns the value directly. `qualia-dik` documents that callers
+/// write the call once per platform instead of hiding the difference, so this
+/// function is the only place in this crate where a platform `cfg` appears; no
+/// method carries one.
+///
+/// On a platform whose backend is not implemented, the store returned here fails
+/// every operation with an error naming that platform, and **nothing falls back
+/// to a software key**.
+fn open_platform_key_store() -> Result<PlatformKeyStore, FfiError> {
+    #[cfg(target_os = "windows")]
+    {
+        PlatformKeyStore::open_best_available().map_err(platform_error)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(PlatformKeyStore::open_best_available())
+    }
+}
+
+/// Converts an error of the device identity library into an [`FfiError`].
+///
+/// The core wraps that error in its own `Error::Device` variant (`#[from]`), so
+/// it reaches the host side with the stable `kind` that [`core_error_kind`]
+/// already assigns to it: `device_public_key_invalid` and
+/// `device_signature_invalid` keep their specific kinds, every other key store
+/// failure is `device_error`. The library's messages are safe to pass on: each
+/// `reason` field is a fixed `&'static str` supplied by the library, never key
+/// material.
+fn platform_error(source: qualia_dik::Error) -> FfiError {
+    Error::from(source).into()
 }
 
 /// A 2FA entry, as represented across the FFI boundary.
@@ -2394,8 +2618,13 @@ mod tests {
             "the master key must already be in the new device's platform store"
         );
 
-        let new_vault = FfiVault::open(joiner_store, data).expect("the new device should open the old device's vault");
-        assert_eq!(new_vault.entry_count(), 1, "the old device's entry should be visible");
+        let new_vault = FfiVault::open(joiner_store, data)
+            .expect("the new device should open the old device's vault");
+        assert_eq!(
+            new_vault.entry_count(),
+            1,
+            "the old device's entry should be visible"
+        );
     }
 
     /// A login can be completed only once, and the second attempt reports the
@@ -2475,7 +2704,8 @@ mod tests {
             .expect("registration should succeed");
 
         let verifier = FfiVerifier::begin().expect("should start the challenge");
-        let responder = FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
+        let responder =
+            FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
         let response = responder
             .respond(vault.clone(), "device-a".to_owned(), keys)
             .expect("should produce the response");
@@ -2487,8 +2717,12 @@ mod tests {
             "the second step should pass"
         );
 
-        let session_id = verifier.session_id().expect("a session identifier should exist after verification");
-        let confirmation = verifier.confirmation().expect("a confirmation tag should exist after verification");
+        let session_id = verifier
+            .session_id()
+            .expect("a session identifier should exist after verification");
+        let confirmation = verifier
+            .confirmation()
+            .expect("a confirmation tag should exist after verification");
         assert!(
             responder
                 .confirm(vault, session_id, confirmation)
@@ -2505,7 +2739,8 @@ mod tests {
         let vault = FfiVault::register(keys.clone(), store, "device-a".to_owned())
             .expect("registration should succeed");
         let verifier = FfiVerifier::begin().expect("should start the challenge");
-        let responder = FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
+        let responder =
+            FfiResponder::accept(verifier.challenge()).expect("should accept the challenge");
         let response = responder
             .respond(vault.clone(), "device-a".to_owned(), keys)
             .expect("should produce the response");
@@ -2555,5 +2790,109 @@ mod tests {
             kinds.len(),
             "two variants map to the same kind, so the client side cannot tell them apart"
         );
+    }
+
+    // ── Platform key store forwarding ────────────────────────────────
+
+    /// Sequence that keeps the labels of one process distinct.
+    ///
+    /// `cargo test` runs tests in parallel and the platform key store is global
+    /// shared state: two tests that use one label would delete each other's keys.
+    static PLATFORM_LABEL_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// A device label for tests, unique across the machine.
+    ///
+    /// The label becomes an entry in the **system-wide** key namespace, so it
+    /// carries the `Q2faTest-` prefix the device identity kit's own integration
+    /// tests use. A label without that prefix could name a real user identity,
+    /// and deleting one costs that user the device identity permanently.
+    fn test_label(name: &str) -> String {
+        let sequence = PLATFORM_LABEL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        format!("Q2faTest-{name}-{pid}-{sequence}")
+    }
+
+    /// The label limit is enforced before the platform is touched.
+    ///
+    /// This holds on every machine, with or without a key store: an oversized
+    /// label has to be rejected at the boundary and never reach the platform.
+    #[test]
+    fn an_oversized_label_is_rejected_before_the_platform_is_touched() {
+        match FfiPlatformKeys::open("a".repeat(MAX_LABEL_CHARS + 1)) {
+            Err(FfiError::InputTooLong { kind, limit, .. }) => {
+                assert_eq!(kind, "label");
+                assert_eq!(limit, MAX_LABEL_CHARS as u64);
+            }
+            Err(_) => panic!("expected an InputTooLong error, got another error kind"),
+            Ok(_) => panic!("an oversized label must not reach the platform key store"),
+        }
+    }
+
+    /// The exported key store forwards to the platform's own key store.
+    ///
+    /// Requires a usable platform key store: the TPM or the software KSP on
+    /// Windows. Where there is none — a platform whose backend is not implemented
+    /// yet, or a machine whose key store cannot be opened — the test **skips with
+    /// a printed reason** instead of failing, because what it checks (forwarding)
+    /// cannot be observed without a key store. Printing the reason keeps a skip
+    /// distinguishable from a pass in the test output.
+    #[test]
+    fn platform_keys_forward_to_the_platform_key_store() {
+        let label = test_label("platform-keys");
+        let keys = match FfiPlatformKeys::open(label.clone()) {
+            Ok(keys) => keys,
+            Err(error) => {
+                println!("skipping: no usable platform key store on this machine ({error})");
+                return;
+            }
+        };
+
+        let public_key = keys
+            .device_public_key()
+            .expect("the public key of the opened identity should be readable");
+        assert_eq!(
+            public_key.len(),
+            65,
+            "the public key must be a 65-byte SEC1 uncompressed point"
+        );
+        let public_key = qualia_dik::DevicePublicKey::from_sec1_bytes(&public_key)
+            .expect("the platform must return a point on P-256");
+
+        let message = b"\x01Qualia2FA platform keys";
+        let signature = keys.sign(message.to_vec()).expect("signing should succeed");
+        assert_eq!(
+            signature.len(),
+            64,
+            "the signature must be the 64-byte raw r||s, not DER"
+        );
+        let signature = qualia_dik::DeviceSignature::from_bytes(&signature)
+            .expect("a 64-byte raw signature should parse");
+
+        qualia_dik::device::verify(&public_key, message, &signature)
+            .expect("the signature must verify over the raw message, not over a digest");
+
+        let backend = keys.backend();
+        assert!(
+            backend == "tpm" || backend == "software",
+            "an identity that opened must report a real backend, got {backend}"
+        );
+        assert_eq!(
+            keys.is_hardware_backed(),
+            backend == "tpm",
+            "is_hardware_backed must agree with the backend that is reported"
+        );
+
+        let reopened = FfiPlatformKeys::open(label.clone()).expect("reopening should succeed");
+        assert_eq!(
+            reopened
+                .device_public_key()
+                .expect("the public key should be readable again"),
+            public_key.as_sec1_bytes().to_vec(),
+            "the identity under one label changed: the key was not persisted"
+        );
+
+        DeviceKeyStore::delete(&keys.store, label.as_str())
+            .expect("the test identity should be removable");
     }
 }

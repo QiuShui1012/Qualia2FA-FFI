@@ -66,13 +66,11 @@ thiserror = "2"
 
 # UniFFI version policy:
 #
-# Pinned to the 0.29 line: the application-side binding generator Gobley requires
-# `uniffi = "0.29.4"`, and the Rust and Kotlin scaffolding must be the same
-# version or the generated serialization format differs. Upstream is at 0.32.2.
-#
-# `0.29` is a caret requirement (>=0.29.0, <0.30.0), not a pinned `=0.29.4`:
-# patch releases such as 0.29.5 within the same minor version are picked up
-# automatically.
+# Pinned to an exact patch, not to the `0.29` line: the application-side binding
+# generator Gobley 0.3.7 (2025-10-08, its newest release) generates its bindings
+# against 0.29.4, and the Rust and Kotlin scaffolding must be the same patch
+# release or the generated serialization format differs. A caret requirement
+# would resolve to 0.29.5 from the registry, which is that mismatch.
 #
 # The `cli` feature provides `uniffi::uniffi_bindgen_main`, used by
 # `src/bin/uniffi-bindgen.rs`. It must sit in `[dependencies]`, not in
@@ -83,7 +81,7 @@ thiserror = "2"
 #
 # clap and camino therefore enter this crate's dependency tree for that binary
 # only, and are not linked into cdylib/staticlib.
-uniffi = { version = "0.29", features = ["cli"] }
+uniffi = { version = "=0.29.4", features = ["cli"] }
 
 [dev-dependencies]
 # The tests need a real ECDSA P-256 implementation to play the host device
