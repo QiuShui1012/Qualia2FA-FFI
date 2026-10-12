@@ -1,5 +1,7 @@
 # Qualia2FA-FFI
 
+English version: [README.en.md](README.en.md).
+
 把 [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) 暴露为
 [UniFFI](https://mozilla.github.io/uniffi-rs/) 绑定，供 Kotlin、Swift 等托管语言调用。
 
@@ -11,7 +13,7 @@
 | 许可证 | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-已导出 OTP 相关能力；保险库与同步待后续实现。
+已导出 OTP、保险库、恢复密钥、注册/登录与挑战-应答；同步待后续实现。
 
 ## 用法
 
@@ -281,8 +283,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-本仓库 `path` 依赖 `../Core`（即 `qualia2fa-core`）。本地开发时该目录需存在；
-CI 中以显式检出的兄弟目录满足（见 `.github/workflows/ci.yml`）。
+本仓库按版本号依赖 `qualia2fa-core` 与 `qualia-dik`，两者都发布在 crates.io 上，
+因此不检出任何上游目录，也没有 submodule。
 
 ## 许可证
 
