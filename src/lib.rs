@@ -739,7 +739,7 @@ pub fn core_version() -> String {
 /// A rendered QR code, as pixels the host can draw.
 ///
 /// The pixels are **grayscale**, one byte per pixel, `0` for black and `255` for white.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct FfiQrImage {
     /// Image width in pixels.
     pub width: u32,
@@ -747,6 +747,18 @@ pub struct FfiQrImage {
     pub height: u32,
     /// Grayscale pixels, row major, `width * height` bytes.
     pub pixels: Vec<u8>,
+}
+
+impl core::fmt::Debug for FfiQrImage {
+    /// Prints the dimensions only: the pixels are the code, and during pairing the code
+    /// carries session material that must not reach a log or a panic message.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FfiQrImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The error correction level of a code, named by what it survives.
@@ -2360,10 +2372,7 @@ mod tests {
             let image = qr_encode(text.to_owned(), FfiEcLevel::Medium, 20, 4, 4)
                 .expect("the text must fit in a version 20 code");
             assert_eq!(image.pixels.len(), (image.width * image.height) as usize);
-            assert!(
-                image.pixels.contains(&0),
-                "the code must have dark modules"
-            );
+            assert!(image.pixels.contains(&0), "the code must have dark modules");
             assert!(
                 image.pixels.contains(&255),
                 "the code must have light modules"
