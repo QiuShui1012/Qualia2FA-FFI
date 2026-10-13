@@ -845,9 +845,9 @@ dependencies = [
 
 [[package]]
 name = "qualia-transport"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "177dc30ebbe85f58964a87321dbbd0c40e155fc0141061d510221d856d5e9df8"
+checksum = "92e1cf79ca0521124ea928c00ff4415cce739a7f75a2369a24dcf23e5bbac2d1"
 dependencies = [
  "qrcodegen",
  "qualia-dik",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-ffi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "p256",
  "qualia-dik",
