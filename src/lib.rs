@@ -56,7 +56,7 @@
 
 uniffi::setup_scaffolding!();
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use qualia_dik::keystore::PlatformKeyStore;
 use qualia_dik::{
@@ -924,6 +924,130 @@ pub fn qr_decode_text(pixels: Vec<u8>, width: u32, height: u32) -> Result<String
     let image =
         qualia_transport::image::GrayImage::from_luma8(width, height, pixels).map_err(qr_error)?;
     qualia_transport::qr::scan::decode_text(&image).map_err(qr_error)
+}
+
+/// What one code of a multi-frame payload holds, in bytes.
+///
+/// A payload larger than this has to be split, and this is the number to give
+/// [`FfiFrameCollector::new`]: both sides have to agree on it, and it depends only on the
+/// profile the codes are drawn with.
+#[uniffi::export]
+pub fn qr_frame_capacity(ec_level: FfiEcLevel, max_version: u8) -> Result<u32, FfiError> {
+    let profile =
+        qualia_transport::qr::QrProfile::new(ec_level.into(), max_version).map_err(qr_error)?;
+    Ok(profile.frame_payload_capacity() as u32)
+}
+
+/// One image of a payload that needs more than one code.
+#[derive(uniffi::Record)]
+pub struct FfiQrFrame {
+    /// The code's number in the sequence, counting from one.
+    pub index: u32,
+    /// How many codes the payload was split into.
+    pub count: u32,
+    /// The image to draw for this code.
+    pub image: FfiQrImage,
+}
+
+/// Draws a payload as a sequence of codes, for payloads that one code cannot carry.
+///
+/// A payload that fits in a single code comes back as one frame, so the caller does not have to
+/// decide which way to draw it: `count` says what the sequence is, and a sequence of one is the
+/// same code [`qr_encode`] would draw.
+///
+/// # Errors
+///
+/// Returns [`FfiError::Qr`] with kind `payload_too_large` when the payload does not fit in
+/// `max_frames` codes, and `bad_render_geometry` when `scale` or `quiet_zone` is zero.
+#[uniffi::export]
+pub fn qr_encode_frames(
+    text: String,
+    ec_level: FfiEcLevel,
+    max_version: u8,
+    max_frames: u32,
+    scale: u16,
+    quiet_zone: u16,
+) -> Result<Vec<FfiQrFrame>, FfiError> {
+    let profile =
+        qualia_transport::qr::QrProfile::new(ec_level.into(), max_version).map_err(qr_error)?;
+    let symbols = profile
+        .encode_payload_frames(text.as_bytes(), max_frames)
+        .map_err(qr_error)?;
+    let count = symbols.len() as u32;
+    symbols
+        .into_iter()
+        .enumerate()
+        .map(|(position, symbol)| {
+            let image = symbol.render(scale, quiet_zone).map_err(qr_error)?;
+            Ok(FfiQrFrame {
+                index: position as u32 + 1,
+                count,
+                image: FfiQrImage {
+                    width: image.width(),
+                    height: image.height(),
+                    pixels: image.pixels().to_vec(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Collects the codes of a multi-frame payload, in any order and with repeats.
+///
+/// The caller reads one code at a time and hands each text to [`FfiFrameCollector::push`]; the
+/// call that completes the set answers with the payload. Codes may arrive twice, out of order,
+/// or both, which is what collecting them by camera looks like: the collector keeps what it has
+/// and reports what is missing, so a screen can show the user how far along it is.
+#[derive(uniffi::Object)]
+pub struct FfiFrameCollector {
+    inner: Mutex<qualia_transport::frame::Reassembler>,
+}
+
+#[uniffi::export]
+impl FfiFrameCollector {
+    /// A collector for codes drawn with a frame capacity of `capacity` bytes, which
+    /// [`qr_frame_capacity`] reports for the profile they were drawn with.
+    #[uniffi::constructor]
+    pub fn new(capacity: u32) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(qualia_transport::frame::Reassembler::new(capacity as usize)),
+        })
+    }
+
+    /// Takes one read code, answering with the payload once the set is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FfiError::Qr`] with kind `not_our_qr_text` for a code of another application,
+    /// and `malformed_frame_header` for one of this application's that is not a frame.
+    pub fn push(&self, text: String) -> Result<Option<Vec<u8>>, FfiError> {
+        let mut inner = self.lock();
+        inner.push(text.trim()).map_err(qr_error)
+    }
+
+    /// How many codes have been accepted so far.
+    pub fn received(&self) -> u32 {
+        self.lock().received() as u32
+    }
+
+    /// How many codes the set has, once one of them has said so.
+    pub fn expected(&self) -> Option<u32> {
+        self.lock().expected_frames()
+    }
+
+    /// The numbers of the codes still missing, once the count is known.
+    pub fn missing(&self) -> Vec<u32> {
+        self.lock().missing()
+    }
+}
+
+impl FfiFrameCollector {
+    /// Takes the lock, ignoring poisoning (see [`FfiVault::lock`]).
+    fn lock(&self) -> std::sync::MutexGuard<'_, qualia_transport::frame::Reassembler> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Reduces a transport error to a kind and a message, without the payload.
@@ -4466,5 +4590,47 @@ mod tests {
             "the header is checked before anything is decrypted"
         );
         assert_eq!(devices.vault_b.entry_count(), 1, "the vault is untouched");
+    }
+
+    /// A payload too large for one code travels as several, collected across the boundary.
+    ///
+    /// The frame images are read back through the same entry point a camera's picture goes
+    /// through, so what is asserted is the whole path: draw the frames, take their text out of
+    /// the pixels, hand them over in the wrong order and with a repeat, and get back the
+    /// payload that went in.
+    #[test]
+    fn a_payload_too_large_for_one_code_travels_as_several() {
+        let payload = format!("otpauth://totp/example?secret={}", "A".repeat(3000));
+        let frames = qr_encode_frames(payload.clone(), FfiEcLevel::Medium, 20, 32, 4, 4)
+            .expect("the frames should be drawn");
+        assert!(
+            frames.len() > 1,
+            "3000 bytes must need more than one code, not {}",
+            frames.len()
+        );
+
+        let capacity = qr_frame_capacity(FfiEcLevel::Medium, 20).expect("a capacity");
+        let collector = FfiFrameCollector::new(capacity);
+        let mut order: Vec<&FfiQrFrame> = frames.iter().rev().collect();
+        order.push(frames.first().expect("at least one frame"));
+
+        let mut completed: Option<Vec<u8>> = None;
+        for frame in order {
+            let text = qr_decode_text(
+                frame.image.pixels.clone(),
+                frame.image.width,
+                frame.image.height,
+            )
+            .expect("a frame's own image must be readable");
+            if let Some(bytes) = collector.push(text).expect("a frame of this application") {
+                completed = Some(bytes);
+            }
+        }
+
+        assert_eq!(
+            String::from_utf8(completed.expect("the set completes")).expect("UTF-8 text"),
+            payload
+        );
+        assert!(collector.missing().is_empty(), "nothing is left missing");
     }
 }
