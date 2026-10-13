@@ -1330,23 +1330,23 @@ impl FfiPlatformKeys {
 ///
 /// # Why one `cfg` appears here
 ///
-/// The two constructors differ **on purpose**: opening a provider on Windows can
-/// fail — no TPM, disabled by group policy, key store held by another process —
-/// and returns a `Result`, while the placeholder compiled on every other platform
-/// cannot fail and returns the value directly. `qualia-dik` documents that callers
-/// write the call once per platform instead of hiding the difference, so this
-/// function is the only place in this crate where a platform `cfg` appears; no
-/// method carries one.
+/// The constructors differ **on purpose**: opening a key store can fail where there is one
+/// to open — Windows may have no TPM, a key store held by another process or a policy that
+/// forbids it, and Android may be reached without the Java VM this library needs — and those
+/// return a `Result`. The placeholder compiled on the remaining platforms cannot fail and
+/// returns the value directly. `qualia-dik` documents that callers write the call once per
+/// platform instead of hiding the difference, so this function is the only place in this
+/// crate where a platform `cfg` appears; no method carries one.
 ///
 /// On a platform whose backend is not implemented, the store returned here fails
 /// every operation with an error naming that platform, and **nothing falls back
 /// to a software key**.
 fn open_platform_key_store() -> Result<PlatformKeyStore, FfiError> {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "android"))]
     {
         PlatformKeyStore::open_best_available().map_err(platform_error)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
     {
         Ok(PlatformKeyStore::open_best_available())
     }
