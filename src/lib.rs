@@ -906,6 +906,26 @@ pub fn qr_decode(pixels: Vec<u8>, width: u32, height: u32) -> Result<String, Ffi
     })
 }
 
+/// Reads **any** text out of a grayscale image, whichever application drew the code.
+///
+/// This is the entry point for a screen that receives text and decides what it means for
+/// itself: an `otpauth://` link to import, a code handed over by someone else's server. Use
+/// [`qr_decode`] instead when the caller wants *this* application's payload, because that one
+/// skips foreign codes rather than handing back the first one it finds.
+///
+/// The input is pixels, not an image file, for the reason given on [`qr_decode`].
+///
+/// # Errors
+///
+/// The same kinds as [`qr_decode`] except `not_our_qr_text`, which this entry point cannot
+/// report: a code of another application is exactly what it is here to read.
+#[uniffi::export]
+pub fn qr_decode_text(pixels: Vec<u8>, width: u32, height: u32) -> Result<String, FfiError> {
+    let image =
+        qualia_transport::image::GrayImage::from_luma8(width, height, pixels).map_err(qr_error)?;
+    qualia_transport::qr::scan::decode_text(&image).map_err(qr_error)
+}
+
 /// Reduces a transport error to a kind and a message, without the payload.
 ///
 /// The transport error is `#[non_exhaustive]`, so the wildcard arm is required by the
