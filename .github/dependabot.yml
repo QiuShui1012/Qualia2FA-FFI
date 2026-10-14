@@ -1,0 +1,42 @@
+# Dependabot keeps the dependency graph moving without a red CI being the thing
+# that announces an update. The gate stays where it is: `cargo-deny-action` in the
+# CI workflow decides whether a new version may enter the lockfile, and the test
+# suite decides whether it works. This file only decides when the question is
+# asked, and the answer is "as a pull request, not as a broken main branch".
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    # A conventional-commit prefix, because that is what this repository's history
+    # uses and a squashed Dependabot pull request is a commit like any other.
+    commit-message:
+      prefix: build
+      include: scope
+    # Grouped so that a week of patch releases is one pull request to review rather
+    # than ten. Security updates are deliberately not grouped: those arrive as their
+    # own pull request, which is the point of having them.
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns:
+          - "*"
