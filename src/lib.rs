@@ -926,6 +926,33 @@ pub fn qr_decode_text(pixels: Vec<u8>, width: u32, height: u32) -> Result<String
     qualia_transport::qr::scan::decode_text(&image).map_err(qr_error)
 }
 
+/// Takes the envelope off a single-frame code, answering with what was put in.
+///
+/// The counterpart of [`qr_encode`]: a screen that reads a code gets the envelope, which says
+/// how many codes the payload was split into, and a screen that shows one code at a time wants
+/// back the text it drew. A code of a set (`2/5`) is not this function's business and is
+/// reported as incomplete rather than unwrapped.
+///
+/// # Errors
+///
+/// Returns [`FfiError::Qr`] with kind `not_our_qr_text` for a text that is not this
+/// application's envelope, `incomplete_frames` for one that is part of a set, and
+/// `payload_not_utf8` for one whose contents are not text.
+#[uniffi::export]
+pub fn qr_unwrap_text(text: String) -> Result<String, FfiError> {
+    let mut reassembler = qualia_transport::frame::Reassembler::from_first_frame();
+    let payload = reassembler
+        .push(text.trim())
+        .map_err(qr_error)?
+        .ok_or_else(|| FfiError::Qr {
+            kind: "incomplete_frames".to_owned(),
+            detail: "the code is one of several, so it carries only part of the payload".to_owned(),
+        })?;
+    String::from_utf8(payload).map_err(|_| FfiError::Qr {
+        kind: "payload_not_utf8".to_owned(),
+        detail: "the code carried bytes that are not UTF-8 text".to_owned(),
+    })
+}
 /// What one code of a multi-frame payload holds, in bytes.
 ///
 /// A payload larger than this has to be split, and this is the number to give
@@ -992,6 +1019,16 @@ pub fn qr_encode_frames(
         .collect()
 }
 
+/// What one read code was, and what it did to the set it belongs to.
+#[derive(uniffi::Record)]
+pub struct FfiFrameStep {
+    /// The code's number in the sequence, counting from one.
+    pub index: u32,
+    /// How many codes the sequence has.
+    pub count: u32,
+    /// The payload, present only in the call that completes the set.
+    pub payload: Option<Vec<u8>>,
+}
 /// Collects the codes of a multi-frame payload, in any order and with repeats.
 ///
 /// The caller reads one code at a time and hands each text to [`FfiFrameCollector::push`]; the
@@ -1014,15 +1051,21 @@ impl FfiFrameCollector {
         })
     }
 
-    /// Takes one read code, answering with the payload once the set is complete.
+    /// Takes one read code, answering with what it was and whether it completed the set.
     ///
     /// # Errors
     ///
     /// Returns [`FfiError::Qr`] with kind `not_our_qr_text` for a code of another application,
     /// and `malformed_frame_header` for one of this application's that is not a frame.
-    pub fn push(&self, text: String) -> Result<Option<Vec<u8>>, FfiError> {
+    pub fn push(&self, text: String) -> Result<FfiFrameStep, FfiError> {
+        let frame = qualia_transport::frame::decode_frame(text.trim()).map_err(qr_error)?;
         let mut inner = self.lock();
-        inner.push(text.trim()).map_err(qr_error)
+        let payload = inner.push(text.trim()).map_err(qr_error)?;
+        Ok(FfiFrameStep {
+            index: frame.index,
+            count: frame.total,
+            payload,
+        })
     }
 
     /// How many codes have been accepted so far.
@@ -4622,7 +4665,9 @@ mod tests {
                 frame.image.height,
             )
             .expect("a frame's own image must be readable");
-            if let Some(bytes) = collector.push(text).expect("a frame of this application") {
+            let step = collector.push(text).expect("a frame of this application");
+            assert!(step.index >= 1 && step.index <= step.count);
+            if let Some(bytes) = step.payload {
                 completed = Some(bytes);
             }
         }
