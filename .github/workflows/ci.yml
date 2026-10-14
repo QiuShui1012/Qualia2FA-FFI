@@ -28,7 +28,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Both dependencies (`qualia2fa-core`, `qualia-dik`) are crates.io version
       # dependencies, so this repository checks nothing out.
@@ -62,7 +62,7 @@ jobs:
     name: Generate the bindings (Kotlin / Swift)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `--all-targets` is required: `--bin uniffi-bindgen` builds only that binary and
       # produces no cdylib, while the binding generator reads
