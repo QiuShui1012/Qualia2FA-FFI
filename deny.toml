@@ -34,6 +34,17 @@ version = 2
 ignore = [
     # Advisories that must be accepted temporarily belong here, with a reason and an expiry date:
     # { id = "RUSTSEC-0000-0000", reason = "no reachable path, await upstream 0.3.x (review: 2026-12-31)" },
+    # `paste` is a procedural macro crate reached through the LAN data plane's own
+    # stack (`iroh` -> `netwatch` -> `netdev` -> `netlink-packet-core`). It is
+    # **unmaintained, not vulnerable**: no advisory describes a defect in it, and no
+    # safe upgrade exists. A procedural macro runs while compiling and does not
+    # enter the artifact, so what is accepted here is a build-time dependency. The
+    # transport crate accepts the same advisory for the same stack and asks for a
+    # re-evaluation before mobile enables the feature, which is exactly this build:
+    # it is reached on Android as well, and nothing about it changes with the
+    # target. The alternatives are to wait for `netlink-packet-core` to replace it
+    # or to give up the LAN data plane on every platform.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro reached only through the LAN data plane's network watcher; no safe upgrade exists (review: 2027-06-30)" },
 ]
 
 [licenses]
@@ -49,6 +60,10 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # `webpki-roots`, the CA list the QUIC stack carries for its own TLS, is
+    # CDLA-Permissive-2.0: a permissive license over the data file it ships, with
+    # no copyleft obligation beyond attribution.
+    "CDLA-Permissive-2.0",
     "ISC",
     # `r-efi` (UEFI support tables on Windows) is LGPL-2.1-or-later, which is
     # compatible with this project's LGPL-3.0-or-later: LGPL-3.0 section 3 allows

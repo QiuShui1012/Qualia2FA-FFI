@@ -13,7 +13,8 @@ English version: [README.en.md](README.en.md).
 | 许可证 | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-已导出 OTP、保险库、恢复密钥、注册/登录与挑战-应答；同步待后续实现。
+已导出 OTP、保险库、恢复密钥、注册/登录、挑战-应答与同步。除此之外，本层还**自己实现**
+了局域网通道（组播发现 + 端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
 
 ## 用法
 
@@ -181,8 +182,9 @@ responder.confirm(vault, verifier.sessionId()!!, verifier.confirmation()!!)  // 
 同步是**两台设备各出一个码、一次一个方向**：一方出示自己的状态，另一方读入并合并，
 然后反过来。载荷由核心加密并认证，通道只负责搬字节。
 
-**通道由端侧实现**（`FfiTransport`）：今天的实现是「文本/二维码」这一条，将来的
-局域网通道接在同一个位置上。
+**通道有两条，接口只有一个**（`FfiTransport`）：一条由端侧实现，把载荷变成用户搬运的
+文本/二维码；另一条由本层实现，走局域网（见下）。两者满足同一套契约，所以会话代码对
+两种载体没有分支。
 
 ```kotlin
 // 通道：一个出站队列 + 一个入站队列，不含任何判断
@@ -235,7 +237,69 @@ vault.serialize()?.let(::saveVault)     // 合并写进了保险库，必须落�
 
 > **重放日志不落盘。** 同一次运行里同一个载荷不会被应用两次；重启之后日志是空的，
 > 同一个载荷可以再被合并一次——合并是幂等的，结果不变。二维码通道是带外、一次性的，
-> 这个边界因此可以接受；将来局域网通道需要它跨重启时再暴露出来。
+> 这个边界因此可以接受；局域网通道用的是同一个会话，所以它的重放日志同样只存在于
+> 本次运行里。将来需要它跨重启时再暴露出来。
+
+### 局域网通道（`FfiLanChannel` / `FfiLanLobby`）
+
+除了二维码那一半，本层还**自己实现**了局域网通道：`FfiLanChannel` 是一个可以拨号的
+端点，`FfiLanLobby` 是同一网段上的发现。它与端侧自己实现的 `FfiTransport` **满足同一套
+契约**（`send` / `receive` / `peers` / `capabilities`），因此会话代码对两种载体没有
+分支：`FfiSyncSession` 收的是 `Arc<dyn FfiTransport>`，看不出拿到的是哪一个。
+
+```kotlin
+// 发起方：打开端点与大厅，把 record() 交给自己的配对码
+val channel = FfiLanChannel.open(deviceId)      // 显式打开：占一个 UDP 端口与一套运行时
+val lobby = channel.openLobby()                 // 显式开始公告；不调用就不公告
+showCode(withRecord(host.payload(), channel.record()))
+
+// 加入方：扫到码之后在大厅里按记录找到那台设备，记下它可拨的地址
+val record = recordOf(scannedText)              // 端侧自己那层配对码里带的记录
+val peer = lobby.peers().firstOrNull { it.record.contentEquals(record) }
+if (peer?.socket != null) channel.rememberPeer(peer.deviceId, peer.record, peer.socket!!)
+
+// 之后就是同一套同步会话：载体换了，协议与裁决一个字都没变
+val session = FfiSyncSession.open(vault)
+session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKind.Vault)
+```
+
+`withRecord` / `recordOf` 代表端侧自己那层配对码：**本层不定义配对码的文本格式**，它只
+提供 `record()`（交出去）与 `FfiLanPeer.record`（拿来比对）。没有大厅可用时（不在同一
+网段、或组播被禁），记录仍然说得清**要找谁**，但说不出**去哪里找**：`rememberPeer` 还需
+一个可拨的地址，而那个地址只有收到过对方报文的一方才有。
+
+| 成员 | 说明 |
+|---|---|
+| `FfiLanChannel.open(deviceId)` | 打开端点，端口由系统选；**端点密钥每次运行重新生成、不落盘** |
+| `record()` | 本端点的连接记录（端点公钥 + 端口，42 字节定长），交给配对码或别的带外通道 |
+| `rememberPeer(deviceId, record, socket)` | 登记一个可拨的对端；`socket` 只有 **IP** 有用，**端口以记录为准** |
+| `forgetPeer(deviceId)` | 忘记该对端并关闭到它的连接 |
+| `transport()` | 把本对象作为 `FfiTransport` 交给会话 |
+| `openLobby()` | 开始公告与收听，返回 `FfiLanLobby` |
+| `shutdown()` | 关闭端点：连接全关、运行时停止；重复调用安全 |
+| `FfiLanLobby.peers()` | 已知的对端，**含已经离开的**（`here` 为 false） |
+| `FfiLanLobby.announceNow()` | 立刻公告一次，不等下一个周期 |
+| `FfiLanLobby.shutdown()` | 一次告别，然后停掉线程与 socket；重复调用安全 |
+| `FfiLanPeer` | `deviceId` / `record` / `socket`（可拨地址 `ip:port`：IP 来自收到报文的那一方、端口是端点公告的那个；可能为 `null`）/ `here` |
+
+三件使用者必须知道的事：
+
+1. **显式打开、显式关闭，不做后台同步。** 打开一个通道就占一个 UDP 端口与一套 tokio
+   运行时（2 个工作线程），打开大厅之后还会按 30 秒的周期往网段里公告自己、并收听
+   别人的公告。两者都不会自动回收：让界面在需要它们的屏幕出现时打开，离开时
+   `shutdown()`。
+2. **连接记录里没有 IP。** `record()` 只有端点公钥与端口，IP 来自**收到组播报文的那
+   一方**——端点自己报出来的 socket 是通配地址（`0.0.0.0`），照它拨号拨不通。因此跨过
+   带外那一步的方式正是「码里带记录，对方在大厅里按记录找到你」，而
+   `FfiLanPeer.socket` 是唯一可拨的地址；没有它的对端只能显示、不能连接。
+3. **依赖 `qualia-transport 0.1.3` 并打开 feature `iroh-lan`，本 crate 无条件打开它。**
+   iroh、tokio 及其依赖树会进入每一次构建（Android 那份也一样），构建时间与产物体积
+   都明显增加。组播发现与二维码并不需要这个 feature，需要它的是这里的数据面。
+
+> `transport().peers()` 报告的是**登记过**的对端，`FfiRecipient.All` 发的就是这些；大厅
+> 报告的是**听到的**对端。两者不是同一个集合：要让一台设备能收到消息，先把它从大厅
+> 登记进来。公告本身**不认证**——它只回答「这个网段上大概有谁、去哪里找他」，真的身份
+> 由连接握手证明，载荷该不该收由核心按设备标识判断。
 
 ## 错误处理
 
@@ -245,9 +309,16 @@ FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 |---|---|
 | `InputTooLong` | 输入超过边界上限 |
 | `Core` | 核心返回的错误，结构化为 `FfiCoreError { kind, message }` |
-| `Qr` | 通道自身报出的失败（`kind` + `detail`），例如图片里读不出码 |
+| `Qr` | 二维码那一半的通道自身报出的失败（`kind` + `detail`），例如图片里读不出码 |
+| `Lan` | 局域网通道自身报出的失败（`kind` + `detail`），例如加入不了组播组、对端没有登记过 |
 | `InvalidDeviceId` | 传进来的设备标识不是 64 位十六进制 |
 | `UnknownConflict` | 为一条不在等待裁决的冲突做了裁决：裁决只属于产生它的那次合并 |
+
+`Lan` 的 `kind` 与 `Qr` 一样是稳定标识，常见的几个：`lan_socket`（端点没有绑定的 socket）、
+`lan_transport`（运行时或绑定失败）、`no_connection_to_peer`（对端没登记过或连不上）、
+`payload_too_large`、`no_lan_peers_found`、`bad_socket`（传进来的地址不是 `ip:port`），
+以及连接记录的 `not_our_lan_address` / `bad_lan_address_length` / `zero_port`。枚举是
+`#[non_exhaustive]` 的，未映射的变体一律落到 `lan_error`，因此**兜底分支必须有**。
 
 `kind` 是**稳定的机器可读标识**（如 `secret_empty`、`vault_entry_not_found`），
 端侧据此分流 UI；`message` 仅供展示与日志。这些字符串属于公开接口：**可以新增，

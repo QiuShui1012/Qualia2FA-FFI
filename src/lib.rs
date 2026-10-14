@@ -56,12 +56,17 @@
 
 uniffi::setup_scaffolding!();
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use qualia_dik::keystore::PlatformKeyStore;
 use qualia_dik::{
     DEVICE_ID_LEN, DeviceId, DeviceKeyStore, DevicePublicKey, DeviceSignature, DeviceSigner,
 };
+use qualia_transport::lan::transport::Recipient as LanRecipient;
+use qualia_transport::lan::transport::{IrohLan, MAX_MESSAGE_LEN, PeerAddress};
+use qualia_transport::lan::wire::{ENDPOINT_KEY_LEN, EndpointKey, Peer, PeerStatus};
+use qualia_transport::lan::{LanAddress, lobby::Lobby};
 use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
@@ -322,6 +327,7 @@ impl FfiError {
             FfiError::InputTooLong { .. } => "input_too_long",
             FfiError::Core { detail } => &detail.kind,
             FfiError::Qr { kind, .. } => kind,
+            FfiError::Lan { kind, .. } => kind,
             FfiError::InvalidDeviceId { .. } => "invalid_device_id",
             FfiError::UnknownConflict { .. } => "unknown_conflict",
         }
@@ -397,6 +403,20 @@ pub enum FfiError {
     /// carries a payload.
     #[error("{detail}")]
     Qr {
+        /// Stable kind for the host to branch on, in `snake_case`.
+        kind: String,
+        /// Human-readable detail. Never contains a payload or a secret.
+        detail: String,
+    },
+
+    /// An error from the LAN channel.
+    ///
+    /// Separate from [`FfiError::Qr`] for the same reason that one is separate from
+    /// [`FfiError::Core`]: it is a different layer with a different set of failure modes — a
+    /// socket that cannot be opened, a connection to a peer that was never registered, a
+    /// multicast group that cannot be joined. The message never carries a payload.
+    #[error("{detail}")]
+    Lan {
         /// Stable kind for the host to branch on, in `snake_case`.
         kind: String,
         /// Human-readable detail. Never contains a payload or a secret.
@@ -1286,6 +1306,7 @@ fn ffi_to_core_error(source: FfiError) -> Error {
         // other error that has no core equivalent.
         FfiError::InputTooLong { .. }
         | FfiError::Qr { .. }
+        | FfiError::Lan { .. }
         | FfiError::InvalidDeviceId { .. }
         | FfiError::UnknownConflict { .. } => Error::DeviceKeyMissing,
     }
@@ -2745,7 +2766,10 @@ pub struct FfiReceivedMessage {
     pub message: Vec<u8>,
 }
 
-/// A channel that can move sync payloads. **Implemented by the host side.**
+/// A channel that can move sync payloads.
+///
+/// **Implemented by the host side**, and by this layer's own [`FfiLanChannel`]: a session
+/// takes either and cannot tell them apart.
 ///
 /// Corresponds to [`qualia2fa_core::transport::Transport`]. An implementation forwards to a
 /// real transport, **with no decisions of its own**: every protocol rule (what the bytes
@@ -2888,11 +2912,11 @@ fn parse_device_id(text: &str) -> Result<DeviceId, FfiError> {
     Ok(DeviceId::from_bytes(id))
 }
 
-/// Converts a failure reported by a host-side channel back into a core error.
+/// Converts a failure reported by a channel back into a core error.
 ///
-/// The channel reports failures as [`FfiError::Qr`], whose `kind` is stable (see
-/// [`FfiError::kind`]). Two of them have a core equivalent the protocol reacts to, and they
-/// are the two where the reaction differs:
+/// A channel reports failures as [`FfiError::Qr`] (the host side's own) or [`FfiError::Lan`]
+/// (this layer's), and both carry a stable `kind` (see [`FfiError::kind`]). Two of them have a
+/// core equivalent the protocol reacts to, and they are the two where the reaction differs:
 ///
 /// - `transport_already_used`: a one-shot channel was used twice.
 /// - `sync_no_session_found`: nothing to receive. A channel that prefers `Ok(None)` for
@@ -2902,12 +2926,18 @@ fn parse_device_id(text: &str) -> Result<DeviceId, FfiError> {
 /// own message belongs to the channel and is not part of the protocol layer.
 fn transport_error_to_core_error(source: FfiError) -> Error {
     match &source {
-        FfiError::Qr { kind, .. } if kind == "transport_already_used" => {
+        FfiError::Qr { kind, .. } | FfiError::Lan { kind, .. }
+            if kind == "transport_already_used" =>
+        {
             Error::TransportAlreadyUsed
         }
-        FfiError::Qr { kind, .. } if kind == "sync_no_session_found" => Error::SyncNoSessionFound,
+        FfiError::Qr { kind, .. } | FfiError::Lan { kind, .. }
+            if kind == "sync_no_session_found" =>
+        {
+            Error::SyncNoSessionFound
+        }
         _ => Error::TransportFailed {
-            reason: "the host-side channel reported a failure",
+            reason: "the channel reported a failure",
         },
     }
 }
@@ -3349,6 +3379,389 @@ fn to_hex(bytes: &[u8]) -> String {
         out.push(char::from_digit(u32::from(byte & 0x0F), 16).unwrap_or('0'));
     }
     out
+}
+
+// ── The LAN channel: discovery, and an FfiTransport this layer owns ──────
+//
+// The code channel above is the host side's: the application implements [`FfiTransport`] over
+// text the user carries from one device to the other. This half runs the other way — the
+// channel is built here, out of `qualia-transport`'s iroh endpoint, and handed to the host
+// side as an object it forwards to. A review of this section asks the same question the sync
+// section asks: **has any protocol rule been copied in from the core?**
+
+/// One device the lobby has heard announcing itself on this network segment.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiLanPeer {
+    /// Device identifier, hexadecimal, the form every identifier uses at this boundary.
+    pub device_id: String,
+    /// The peer's connection record, as [`FfiLanChannel::remember_peer`] takes it.
+    ///
+    /// Carried as the transport's own bytes rather than as a string invented here: the record
+    /// is versioned and checksummed there, and its fields are the endpoint public key and the
+    /// port.
+    pub record: Vec<u8>,
+    /// The peer's address, as `ip:port`, or `None` when there was no source for it.
+    ///
+    /// **This is the only address a peer can be dialed at.** An announcement carries no address
+    /// of its own, and an endpoint reports its own sockets as the wildcard address, so neither
+    /// the peer nor this device can name one: whoever received the datagram is the only party
+    /// that knows where it came from. The IP is that sender's; the port is the one the peer
+    /// announced, because the datagram itself left the lobby's socket.
+    pub socket: Option<String>,
+    /// Whether the peer is still announcing itself (`false` after a `Bye`).
+    pub here: bool,
+}
+
+/// The LAN channel: one endpoint on this network segment, and the peers it sends to.
+///
+/// # It satisfies the same contract as a host-side channel
+///
+/// The five points in [`FfiTransport`]'s documentation hold here unchanged: `receive` reports
+/// the sender truthfully, `send` respects the recipient, `receive` never blocks, the channel
+/// is not single-use, and device identifiers are 64 hexadecimal characters. The difference is
+/// **who owns it**: this object, rather than the application.
+///
+/// # What it declares
+///
+/// One message may be up to the transport's own cap, the channel may be reused, and it can
+/// carry a whole payload. The roster is declared multi-party because the endpoint accepts a
+/// connection from any device on the segment, even though one exchange involves two of them:
+/// the declaration describes the channel, not the session.
+///
+/// # The peer table is kept here as well
+///
+/// [`FfiTransport::peers`] has to answer what `All` means, and the transport's own accessor
+/// reports *connected* peers while `All` goes to *registered* ones. This layer therefore
+/// mirrors the table it writes, through [`FfiLanChannel::remember_peer`] and
+/// [`FfiLanChannel::forget_peer`] alone.
+///
+/// # Current state
+///
+/// The endpoint is bound to a system-chosen port and its key is generated per process; neither
+/// is persisted. A peer that remembered an earlier address has to be told the current one,
+/// which is what a lobby announcement or a code the user carries is for.
+#[derive(uniffi::Object)]
+pub struct FfiLanChannel {
+    /// The endpoint and its own peer table.
+    inner: IrohLan,
+    /// This device's identifier, parsed once: the core asks for it as a value that cannot fail.
+    me: DeviceId,
+    /// The peers this channel sends to, in the order they were registered.
+    peers: Mutex<Vec<DeviceId>>,
+}
+
+#[uniffi::export]
+impl FfiLanChannel {
+    /// Opens an endpoint for this device, bound to a system-chosen port.
+    ///
+    /// The endpoint key is generated here and is **not** the device identity from the platform
+    /// key store: it is the transport's own identity, proved by the QUIC handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidDeviceId`] when the identifier is not 64 hexadecimal characters;
+    /// [`FfiError::Core`]`{ kind: "randomness_unavailable" }` when the endpoint key cannot be
+    /// generated; [`FfiError::Lan`] when the endpoint cannot be built, which in practice means
+    /// no free port or system policy blocking UDP.
+    #[uniffi::constructor]
+    pub fn open(device_id: String) -> Result<Arc<Self>, FfiError> {
+        let me = parse_device_id(&device_id)?;
+        let mut secret = [0_u8; ENDPOINT_KEY_LEN];
+        qualia2fa_core::getrandom::fill(&mut secret).map_err(|_| FfiError::Core {
+            detail: Error::RandomnessUnavailable.into(),
+        })?;
+
+        Ok(Arc::new(Self {
+            inner: IrohLan::open(me, EndpointKey::from_bytes(secret)).map_err(lan_error)?,
+            me,
+            peers: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// This endpoint's connection record: what a peer needs in order to dial it.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Lan`]`{ kind: "lan_socket" }` when the endpoint has no bound socket, which
+    /// cannot happen while it is open.
+    pub fn record(&self) -> Result<Vec<u8>, FfiError> {
+        let port = self.port()?;
+        Ok(LanAddress::new(self.inner.endpoint_key(), port)
+            .encode()
+            .to_vec())
+    }
+
+    /// Registers a peer this channel may send to.
+    ///
+    /// `socket` is `ip:port`, taken from a lobby announcement: see [`FfiLanPeer::socket`] for
+    /// why nothing else can supply it. **Its port is not used**: the record carries the port the
+    /// endpoint listens on, while the address a datagram arrives from carries the lobby's, so
+    /// only its IP is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidDeviceId`] for a malformed identifier,
+    /// [`FfiError::Lan`]`{ kind: "bad_socket" }` for an address that is not `ip:port`, and the
+    /// transport's own kinds for a record it cannot parse.
+    pub fn remember_peer(
+        &self,
+        device_id: String,
+        record: Vec<u8>,
+        socket: String,
+    ) -> Result<(), FfiError> {
+        let device = parse_device_id(&device_id)?;
+        let address = LanAddress::decode(&record).map_err(lan_error)?;
+        let socket = parse_socket(&socket)?;
+        self.inner.remember_peer(PeerAddress::new(
+            device,
+            address.endpoint_key,
+            Some(SocketAddr::new(socket.ip(), address.port)),
+        ));
+
+        let mut peers = self.lock_peers();
+        if !peers.contains(&device) {
+            peers.push(device);
+        }
+        Ok(())
+    }
+
+    /// Forgets a peer, and closes the connection to it.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidDeviceId`] when the identifier is malformed.
+    pub fn forget_peer(&self, device_id: String) -> Result<(), FfiError> {
+        let device = parse_device_id(&device_id)?;
+        self.inner.forget_peer(&device);
+        self.lock_peers().retain(|known| *known != device);
+        Ok(())
+    }
+
+    /// This channel as the transport trait the sessions take.
+    ///
+    /// The host side passes the result wherever it passes its own channel: one exchange over
+    /// two kinds of carrier, with no branch in the session and nothing copied. UniFFI hands
+    /// this object across as an [`FfiTransport`] implementation.
+    #[must_use]
+    pub fn transport(self: &Arc<Self>) -> Arc<dyn FfiTransport> {
+        Arc::clone(self) as Arc<dyn FfiTransport>
+    }
+
+    /// Starts announcing this endpoint on the local network, and collecting announcements.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Lan`]: `lan_socket` when the endpoint has no bound socket, and the
+    /// transport's socket kinds when the multicast group cannot be joined — no network, or
+    /// network policy blocking multicast.
+    pub fn open_lobby(&self) -> Result<Arc<FfiLanLobby>, FfiError> {
+        let port = self.port()?;
+        let lobby = Lobby::open(self.me, self.inner.endpoint_key(), port).map_err(lan_error)?;
+        Ok(Arc::new(FfiLanLobby {
+            inner: Mutex::new(lobby),
+        }))
+    }
+
+    /// Closes the endpoint: every connection is closed and its runtime stops.
+    ///
+    /// Calling it more than once is safe.
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+}
+
+/// The five methods a session calls, with this channel behind them.
+///
+/// A plain Rust implementation of the trait the host side implements for itself, so the
+/// session takes a `dyn FfiTransport` and cannot tell which of the two it was handed.
+impl FfiTransport for FfiLanChannel {
+    /// One message may be up to the transport's own cap, the channel may be reused, and it
+    /// carries a whole payload.
+    fn capabilities(&self) -> FfiTransportCapabilities {
+        FfiTransportCapabilities {
+            roster: FfiRoster::MultiParty,
+            max_message_len: Some(MAX_MESSAGE_LEN as u64),
+            max_qr_version: None,
+            single_use: false,
+            can_carry_payload: true,
+        }
+    }
+
+    fn local_device(&self) -> String {
+        self.me.to_hex()
+    }
+
+    /// Returns once the send is **accepted**: the write happens on the transport's own thread
+    /// and cannot report back through this call. What is knowable now — a recipient that was
+    /// never registered, or a message past the declared cap — is reported here.
+    fn send(&self, to: FfiRecipient, message: Vec<u8>) -> Result<(), FfiError> {
+        let to = match to {
+            FfiRecipient::One { device_id } => LanRecipient::One(parse_device_id(&device_id)?),
+            FfiRecipient::All => LanRecipient::All,
+        };
+        self.inner.send(to, &message).map_err(lan_error)
+    }
+
+    /// `Ok(None)` is "nothing available", not a failure; the caller waits or does something
+    /// else. The sender is the device the message claims, which the core compares with the
+    /// sender inside the payload.
+    fn receive(&self) -> Result<Option<FfiReceivedMessage>, FfiError> {
+        match self.inner.try_receive() {
+            Ok((sender, message)) => Ok(Some(FfiReceivedMessage {
+                sender: sender.to_hex(),
+                message,
+            })),
+            Err(qualia_transport::Error::TransportEmpty) => Ok(None),
+            Err(other) => Err(lan_error(other)),
+        }
+    }
+
+    /// The peers this channel will send to, which is what `All` means.
+    fn peers(&self) -> Result<Vec<String>, FfiError> {
+        Ok(self.lock_peers().iter().map(|id| id.to_hex()).collect())
+    }
+}
+
+impl FfiLanChannel {
+    /// This endpoint's port, or the socket kind when it has none.
+    fn port(&self) -> Result<u16, FfiError> {
+        self.inner.port().ok_or_else(|| {
+            lan_error(qualia_transport::Error::LanSocket {
+                operation: "endpoint_port",
+            })
+        })
+    }
+
+    /// Takes the peer-table lock, ignoring poisoning (see [`FfiVault::lock`]).
+    fn lock_peers(&self) -> std::sync::MutexGuard<'_, Vec<DeviceId>> {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The lobby: which devices are announcing themselves on this network segment.
+///
+/// # What it does
+///
+/// One UDP socket in the multicast group and one background thread that announces this
+/// endpoint every thirty seconds and collects what the others announce, keeping a view of the
+/// peers that have not gone stale after three minutes.
+///
+/// # It discovers, it does not connect
+///
+/// No payload travels through the lobby. Its answer is "who is probably here, and where to
+/// reach them", which is a **hint**: an announcement is unauthenticated, so a peer in this
+/// list may be a device claiming an identity it does not hold. What a connection proves is the
+/// endpoint key, and what a payload proves is the master key.
+///
+/// # It is only useful on one segment
+///
+/// Multicast reaches one broadcast domain. Where it does not, a peer has to be handed an
+/// address out of band instead, and the only party that can supply a dialable one is a
+/// receiver — see [`FfiLanPeer::socket`].
+#[derive(uniffi::Object)]
+pub struct FfiLanLobby {
+    /// The lobby, including its worker thread and its own view.
+    inner: Mutex<Lobby>,
+}
+
+#[uniffi::export]
+impl FfiLanLobby {
+    /// Every peer the lobby knows, whether or not it is still here.
+    ///
+    /// A peer that said goodbye or went stale is reported too, with `here` false: "switched
+    /// off" and "lost the network" look different to a user, and dropping the entry would lose
+    /// that difference.
+    ///
+    /// **The pending events are drained first.** The view this reads is the caller's copy, and
+    /// the lobby advances it as events are taken off its queue: reading the view without taking
+    /// them reports an empty list however many devices are announcing themselves. Draining is
+    /// what the transport's own documentation asks of a caller, and it makes a second call
+    /// report what the first one did.
+    #[must_use]
+    pub fn peers(&self) -> Vec<FfiLanPeer> {
+        let mut lobby = self.lock();
+        while lobby.try_poll().is_some() {}
+        lobby.view().all().into_iter().map(lan_peer_of).collect()
+    }
+
+    /// Announces this endpoint now instead of waiting for the interval.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Lan`] with the transport's socket kinds when the datagram cannot be sent.
+    pub fn announce_now(&self) -> Result<(), FfiError> {
+        self.lock().announce_now().map_err(lan_error)
+    }
+
+    /// Closes the lobby: one `Bye`, then the worker thread and the socket.
+    ///
+    /// Calling it more than once is safe.
+    pub fn shutdown(&self) {
+        self.lock().shutdown();
+    }
+}
+
+impl FfiLanLobby {
+    /// Takes the lobby lock, ignoring poisoning (see [`FfiVault::lock`]).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Lobby> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Reduces one peer of the lobby's view to what the host side is handed.
+fn lan_peer_of(peer: Peer) -> FfiLanPeer {
+    FfiLanPeer {
+        device_id: peer.device.to_hex(),
+        record: LanAddress::new(peer.endpoint_key, peer.port)
+            .encode()
+            .to_vec(),
+        socket: peer.socket().map(|socket| socket.to_string()),
+        here: peer.status == PeerStatus::Here,
+    }
+}
+
+/// Parses `ip:port`, the form a socket address crosses this boundary in.
+///
+/// That form is the one `std::net::SocketAddr` prints, so an address taken from a lobby
+/// announcement round-trips through it unchanged.
+fn parse_socket(text: &str) -> Result<SocketAddr, FfiError> {
+    text.parse::<SocketAddr>().map_err(|_| FfiError::Lan {
+        kind: "bad_socket".to_owned(),
+        detail: "the address is not `ip:port`".to_owned(),
+    })
+}
+
+/// Reduces a LAN failure to a kind and a message, without any payload.
+///
+/// Separate from [`qr_error`] because the two halves of `qualia-transport` fail differently:
+/// the code channel fails on text and on capacity, this one on sockets, connections and the
+/// transport's own limits. The wildcard arm is required by the transport's `#[non_exhaustive]`
+/// error enum, so an unmapped variant reaches the host as `lan_error`; its own test pins the
+/// kinds that matter.
+fn lan_error(source: qualia_transport::Error) -> FfiError {
+    use qualia_transport::Error as LanError;
+
+    let kind = match &source {
+        LanError::NoConnectionToPeer => "no_connection_to_peer",
+        LanError::TransportEmpty => "transport_empty",
+        LanError::PayloadTooLarge { .. } => "payload_too_large",
+        LanError::NoLanPeersFound => "no_lan_peers_found",
+        LanError::LanSocket { .. } => "lan_socket",
+        LanError::LanTransport { .. } => "lan_transport",
+        LanError::NotOurLanAddress => "not_our_lan_address",
+        LanError::BadLanAddressLength { .. } => "bad_lan_address_length",
+        LanError::ZeroPort => "zero_port",
+        _ => "lan_error",
+    };
+
+    FfiError::Lan {
+        kind: kind.to_owned(),
+        detail: source.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -4677,5 +5090,336 @@ mod tests {
             payload
         );
         assert!(collector.missing().is_empty(), "nothing is left missing");
+    }
+
+    // ── The LAN channel ──────────────────────────────────────────────────
+
+    /// A device identifier in the form this boundary uses, derived from a seed.
+    fn lan_device(seed: u8) -> String {
+        DeviceId::from_bytes([seed; 32]).to_hex()
+    }
+
+    #[test]
+    fn a_socket_address_round_trips_and_a_wrong_one_is_rejected() {
+        let socket = parse_socket("192.168.1.5:41234").expect("a printed address must parse");
+        assert_eq!(socket.to_string(), "192.168.1.5:41234");
+        assert_eq!(
+            parse_socket("192.168.1.5")
+                .expect_err("a missing port is not an address")
+                .kind(),
+            "bad_socket"
+        );
+        assert_eq!(
+            parse_socket("not an address")
+                .expect_err("text is not an address")
+                .kind(),
+            "bad_socket"
+        );
+    }
+
+    /// The LAN kinds are distinct and are the ones the host side branches on.
+    ///
+    /// The transport's error enum is `#[non_exhaustive]`, so an unmapped variant lands in
+    /// `lan_error` without the compiler saying anything. This list is what says it.
+    #[test]
+    fn every_lan_error_kind_is_distinct_and_known() {
+        use qualia_transport::Error as LanError;
+
+        let cases = [
+            (LanError::NoConnectionToPeer, "no_connection_to_peer"),
+            (LanError::TransportEmpty, "transport_empty"),
+            (
+                LanError::PayloadTooLarge {
+                    needed: 10,
+                    limit: 1,
+                },
+                "payload_too_large",
+            ),
+            (LanError::NoLanPeersFound, "no_lan_peers_found"),
+            (LanError::LanSocket { operation: "bind" }, "lan_socket"),
+            (
+                LanError::LanTransport {
+                    operation: "connect",
+                },
+                "lan_transport",
+            ),
+            (LanError::NotOurLanAddress, "not_our_lan_address"),
+            (
+                LanError::BadLanAddressLength {
+                    expected: 42,
+                    actual: 4,
+                },
+                "bad_lan_address_length",
+            ),
+            (LanError::ZeroPort, "zero_port"),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for (source, expected) in cases {
+            assert_eq!(lan_error(source).kind(), expected);
+            assert!(seen.insert(expected), "{expected} is mapped twice");
+        }
+    }
+
+    /// The channel answers the trait's questions, and answers them the same way through the
+    /// trait object a session is handed.
+    #[test]
+    fn the_lan_capabilities_describe_a_reusable_stream() {
+        let Ok(channel) = FfiLanChannel::open(lan_device(1)) else {
+            return;
+        };
+
+        let caps = channel.capabilities();
+        assert_eq!(caps.roster, FfiRoster::MultiParty);
+        assert_eq!(caps.max_message_len, Some(MAX_MESSAGE_LEN as u64));
+        assert_eq!(caps.max_qr_version, None, "this channel displays no code");
+        assert!(!caps.single_use, "a connection is not a one-shot artifact");
+        assert!(caps.can_carry_payload);
+
+        assert_eq!(channel.local_device(), lan_device(1));
+        assert!(
+            channel
+                .peers()
+                .expect("the peer table is readable")
+                .is_empty(),
+            "a fresh channel has no peers"
+        );
+        assert!(
+            channel
+                .receive()
+                .expect("an empty inbox is not a failure")
+                .is_none(),
+            "nothing has been sent to this channel"
+        );
+
+        let transport = channel.transport();
+        assert_eq!(transport.local_device(), lan_device(1));
+        assert_eq!(transport.capabilities().roster, FfiRoster::MultiParty);
+        assert_eq!(
+            transport.capabilities().max_message_len,
+            Some(MAX_MESSAGE_LEN as u64)
+        );
+        assert!(
+            transport
+                .peers()
+                .expect("the peer table is readable")
+                .is_empty()
+        );
+
+        channel.shutdown();
+    }
+
+    #[test]
+    fn the_record_is_the_transports_own_connection_record() {
+        let Ok(channel) = FfiLanChannel::open(lan_device(2)) else {
+            return;
+        };
+
+        let record = channel.record().expect("an open endpoint has a record");
+        let address = LanAddress::decode(&record).expect("a record this layer built must decode");
+        assert_eq!(address.port, channel.inner.port().expect("a bound port"));
+        assert_eq!(address.endpoint_key, channel.inner.endpoint_key());
+
+        channel.shutdown();
+    }
+
+    #[test]
+    fn a_peer_must_be_registered_before_it_can_be_sent_to() {
+        let Ok(channel) = FfiLanChannel::open(lan_device(3)) else {
+            return;
+        };
+
+        let error = channel
+            .send(
+                FfiRecipient::One {
+                    device_id: lan_device(4),
+                },
+                b"hello".to_vec(),
+            )
+            .expect_err("a peer that was never registered has no connection");
+        assert_eq!(error.kind(), "no_connection_to_peer");
+
+        assert!(
+            channel.send(FfiRecipient::All, b"hello".to_vec()).is_ok(),
+            "a broadcast with nobody registered is accepted and reaches nobody"
+        );
+
+        channel.shutdown();
+    }
+
+    #[test]
+    fn registering_a_peer_takes_a_record_and_an_address() {
+        let Ok(channel) = FfiLanChannel::open(lan_device(5)) else {
+            return;
+        };
+        let Ok(other) = FfiLanChannel::open(lan_device(6)) else {
+            return;
+        };
+
+        let record = other.record().expect("a record");
+        let socket = format!("127.0.0.1:{}", other.inner.port().expect("a port"));
+        channel
+            .remember_peer(lan_device(6), record.clone(), socket.clone())
+            .expect("registering a peer with a real record must work");
+        assert_eq!(
+            channel.peers().expect("the peer table is readable"),
+            vec![lan_device(6)]
+        );
+
+        assert_eq!(
+            channel
+                .remember_peer(lan_device(6), vec![0; 4], socket.clone())
+                .expect_err("four bytes are not a connection record")
+                .kind(),
+            "not_our_lan_address"
+        );
+        assert_eq!(
+            channel
+                .remember_peer(lan_device(6), record.clone(), "not an address".to_owned())
+                .expect_err("a socket address is `ip:port`")
+                .kind(),
+            "bad_socket"
+        );
+        assert_eq!(
+            channel
+                .remember_peer("nope".to_owned(), record.clone(), socket)
+                .expect_err("an identifier is 64 hexadecimal characters")
+                .kind(),
+            "invalid_device_id"
+        );
+        assert_eq!(
+            channel.peers().expect("the peer table is readable"),
+            vec![lan_device(6)],
+            "a rejected registration must not change the peer table"
+        );
+
+        channel
+            .forget_peer(lan_device(6))
+            .expect("forgetting works");
+        assert!(
+            channel
+                .peers()
+                .expect("the peer table is readable")
+                .is_empty()
+        );
+        assert_eq!(
+            channel
+                .forget_peer("nope".to_owned())
+                .expect_err("a malformed identifier is refused")
+                .kind(),
+            "invalid_device_id"
+        );
+
+        other.shutdown();
+        channel.shutdown();
+    }
+
+    /// Two channels on this machine exchange one message, sender included.
+    ///
+    /// Loopback is the only requirement: the addresses come from the endpoints themselves, so
+    /// nothing here needs a real network segment. This is also what pins the sender claim — the
+    /// field the core compares with the sender inside a payload.
+    #[test]
+    fn two_channels_exchange_a_message_over_loopback() {
+        let Ok(a) = FfiLanChannel::open(lan_device(7)) else {
+            return;
+        };
+        let Ok(b) = FfiLanChannel::open(lan_device(8)) else {
+            return;
+        };
+
+        let record = b.record().expect("a record");
+        // The port in this address is deliberately wrong, and only its IP is meant to matter:
+        // the record carries the port the endpoint listens on, while the address a datagram
+        // arrives from carries the lobby's. A caller that hands over what it saw must still
+        // end up dialing the endpoint.
+        a.remember_peer(lan_device(8), record, "127.0.0.1:1".to_owned())
+            .expect("registering a peer must work");
+
+        a.send(
+            FfiRecipient::One {
+                device_id: lan_device(8),
+            },
+            b"the payload".to_vec(),
+        )
+        .expect("the send must be accepted");
+
+        let received = (0..200)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                b.receive().expect("receiving must not fail")
+            })
+            .expect("the message must arrive within five seconds");
+        assert_eq!(received.sender, lan_device(7), "the sender is the claim");
+        assert_eq!(received.message, b"the payload");
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// A discovered peer is offered at the endpoint's own port, not at the port its
+    /// announcement was sent from.
+    ///
+    /// The two differ whenever the lobby is in use — announcements leave the lobby's socket,
+    /// which is bound to the multicast port — and dialing the sender's port reaches a socket
+    /// that speaks the announcement format and never answers a connection.
+    #[test]
+    fn a_discovered_peer_is_offered_at_the_endpoints_own_port() {
+        let device = DeviceId::from_bytes([7; 32]);
+        let peer = Peer {
+            device,
+            endpoint_key: EndpointKey::from_bytes([8; 32]),
+            port: 41_007,
+            source: Some(SocketAddr::from(([192, 168, 1, 7], 21_377))),
+            status: PeerStatus::Here,
+            last_seen_ms: 0,
+            sequence: 0,
+        };
+
+        let offered = lan_peer_of(peer);
+        assert_eq!(offered.device_id, device.to_hex());
+        assert_eq!(
+            offered.socket.as_deref(),
+            Some("192.168.1.7:41007"),
+            "the IP comes from the datagram and the port from the announcement"
+        );
+        assert_eq!(
+            LanAddress::decode(&offered.record)
+                .expect("a record this layer built must decode")
+                .port,
+            41_007
+        );
+        assert!(offered.here);
+
+        let source_unknown = lan_peer_of(Peer {
+            source: None,
+            ..peer
+        });
+        assert_eq!(
+            source_unknown.socket, None,
+            "a peer whose announcement had no source can be shown but not dialed"
+        );
+    }
+
+    #[test]
+    fn a_lobby_reports_its_view_and_stops_cleanly() {
+        let Ok(channel) = FfiLanChannel::open(lan_device(9)) else {
+            return;
+        };
+        let Ok(lobby) = channel.open_lobby() else {
+            return;
+        };
+
+        assert!(
+            lobby.peers().is_empty(),
+            "a lobby that just opened has heard nobody"
+        );
+        lobby
+            .announce_now()
+            .expect("announcing must reach the socket");
+        lobby.shutdown();
+        lobby.shutdown();
+
+        channel.shutdown();
     }
 }

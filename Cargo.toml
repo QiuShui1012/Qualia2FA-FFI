@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
@@ -44,12 +44,24 @@ crate-type = ["cdylib", "staticlib"]
 # `Core/` submodule was removed together with the path dependency.
 qualia2fa-core = "0.1.1"
 
-# The code channel: the host draws a pairing payload (or an entry) as a QR code, and reads
-# one back from an image the user imported. The default features are on deliberately —
-# they carry `scan-image`, the decoding half, and the desktop application needs both
-# halves. Decoding takes pixels rather than an image file, so the image format decoders
-# stay on the platform side.
-qualia-transport = "0.1"
+# The code channel and the LAN channel. The host draws a pairing payload (or an entry) as a
+# QR code and reads one back from an image the user imported; and the LAN half — multicast
+# discovery plus an iroh endpoint — is wrapped by this crate as an `FfiTransport` of its own,
+# because iroh is Rust-only and no host-side implementation could reach it.
+#
+# The default features are on deliberately: they carry `scan-image`, the decoding half, and the
+# desktop application needs both halves. Decoding takes pixels rather than an image file, so
+# the image format decoders stay on the platform side.
+#
+# `iroh-lan` is on because the LAN channel is part of this crate's surface. It brings iroh, a
+# tokio runtime and their tree (about 250 crates) into every build of this library, the Android
+# one included. The transport crate keeps it optional so that a build with no use for the data
+# plane can leave it out; this one has a use for it on every platform it serves.
+#
+# 0.1.3 is the first version that reports the address a lobby announcement arrived from. That
+# address is the only one a discovered peer can be dialed at, so 0.1.2 and older would leave a
+# peer discoverable and unreachable.
+qualia-transport = { version = "0.1.3", features = ["iroh-lan"] }
 
 # Device identity: the `DevicePublicKey` / `DeviceSignature` types live here.
 #

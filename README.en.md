@@ -14,8 +14,10 @@ Kotlin and Swift to call.
 | License | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-OTP capabilities, the vault, recovery keys, registration/login and challenge-response are
-exported; sync remains to be implemented.
+OTP capabilities, the vault, recovery keys, registration/login, challenge-response and
+synchronization are exported. On top of that, this layer **implements the LAN channel itself**
+(multicast discovery plus an endpoint data plane) — that half is Rust-only, and no host-side
+implementation could reach it.
 
 ## Usage
 
@@ -197,8 +199,10 @@ Syncing is **two devices, one code each, one direction at a time**: one shows it
 other reads it and merges it, and then it is the other way round. The payload is encrypted and
 authenticated by the core; the channel only moves bytes.
 
-**The channel is implemented by the host side** (`FfiTransport`): today the text/QR code
-channel, later a LAN channel in the same place.
+**There are two channels and one interface** (`FfiTransport`): the host side implements the
+one that turns a payload into text/QR codes the user carries, and this layer implements the
+one that runs over the LAN (see below). Both satisfy the same contract, so the session code
+has no branch for either.
 
 ```kotlin
 // The channel: an outbound queue and an inbound queue, with no decisions of its own
@@ -255,8 +259,78 @@ it does not know:
 > **The replay log is not persisted.** Within one run the same payload is never applied
 > twice; after a restart the log is empty and the same payload can be merged again — merging
 > is idempotent, so the result is the same. The code channel is out-of-band and one-shot,
-> which is why that boundary is acceptable; a LAN channel that needs it across restarts will
-> be the point at which it is exposed.
+> which is why that boundary is acceptable; the LAN channel goes through the same session, so
+> its replay log lives in one run as well. It will be exposed at the point where it has to
+> survive a restart.
+
+### The LAN channel (`FfiLanChannel` / `FfiLanLobby`)
+
+Besides the QR-code half, this layer **implements the LAN channel itself**: `FfiLanChannel` is
+an endpoint that can be dialed, and `FfiLanLobby` is discovery on the same network segment. It
+**satisfies the same contract** as a host-side `FfiTransport` (`send` / `receive` / `peers` /
+`capabilities`), so the session code has no branch for either carrier: `FfiSyncSession` takes an
+`Arc<dyn FfiTransport>` and cannot tell which one it was handed.
+
+```kotlin
+// Host side: open the endpoint and the lobby, and hand record() to your own pairing code
+val channel = FfiLanChannel.open(deviceId)      // opened explicitly: one UDP port and one runtime
+val lobby = channel.openLobby()                 // announcing starts here; skip it and nothing is announced
+showCode(withRecord(host.payload(), channel.record()))
+
+// Joining side: after scanning, find that device in the lobby by its record and note where it can be dialed
+val record = recordOf(scannedText)              // whatever your own pairing code carries
+val peer = lobby.peers().firstOrNull { it.record.contentEquals(record) }
+if (peer?.socket != null) channel.rememberPeer(peer.deviceId, peer.record, peer.socket!!)
+
+// From here it is the same sync session: the carrier changed, the protocol and the decisions did not
+val session = FfiSyncSession.open(vault)
+session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKind.Vault)
+```
+
+`withRecord` / `recordOf` stand for the host side's own pairing code: **this layer does not
+define that text format**, it only provides `record()` (to hand out) and `FfiLanPeer.record`
+(to match against). Where no lobby is usable — a different segment, or multicast forbidden —
+the record still says **who** to look for, but not where: `rememberPeer` also needs an address,
+and only the party that received a datagram from that peer has one.
+
+| Member | Meaning |
+|---|---|
+| `FfiLanChannel.open(deviceId)` | Opens an endpoint on a system-chosen port; **the endpoint key is generated per run and never persisted** |
+| `record()` | This endpoint's connection record (endpoint key + port, 42 bytes fixed), for a pairing code or another out-of-band route |
+| `rememberPeer(deviceId, record, socket)` | Registers a peer that may be dialed; only the **IP** of `socket` is used, the **port comes from the record** |
+| `forgetPeer(deviceId)` | Forgets that peer and closes the connection to it |
+| `transport()` | Hands this object to a session as an `FfiTransport` |
+| `openLobby()` | Starts announcing and listening; returns an `FfiLanLobby` |
+| `shutdown()` | Closes the endpoint: every connection is closed and the runtime stops; safe to call again |
+| `FfiLanLobby.peers()` | The peers it knows, **including the ones that left** (`here` is false) |
+| `FfiLanLobby.announceNow()` | Announces once right away instead of waiting for the interval |
+| `FfiLanLobby.shutdown()` | One goodbye, then the thread and the socket; safe to call again |
+| `FfiLanPeer` | `deviceId` / `record` / `socket` (the dialable `ip:port`: the IP of whoever received the announcement, the port the endpoint announced; possibly `null`) / `here` |
+
+Three things a caller has to know:
+
+1. **Opened explicitly, closed explicitly, no sync in the background.** An open channel holds
+   one UDP port and one tokio runtime (2 worker threads); an open lobby announces this device
+   into the segment every 30 seconds and listens for the others. Neither is reclaimed
+   automatically: have the interface open them while a screen that needs them is up, and
+   `shutdown()` on the way out.
+2. **A connection record carries no IP.** `record()` holds the endpoint key and the port only;
+   the IP comes from **the party that received the multicast datagram** — an endpoint reports
+   its own socket as the wildcard address (`0.0.0.0`), which cannot be dialed. That is why
+   "the code carries a record, and the peer finds you in the lobby by it" is how the
+   out-of-band step is crossed, and why `FfiLanPeer.socket` is the only dialable address: a
+   peer without one can be shown but not connected to.
+3. **It depends on `qualia-transport 0.1.3` with the `iroh-lan` feature, which this crate
+   enables unconditionally.** iroh, tokio and their tree enter every build, the Android one
+   included, so build time and artifact size both grow noticeably. Multicast discovery and the
+   QR codes do not need that feature; the data plane here does.
+
+> `transport().peers()` reports the **registered** peers, which is what `FfiRecipient.All`
+> reaches; the lobby reports the peers that were **heard**. The two are not the same set: to
+> make a device reachable, register it out of the lobby first. An announcement is
+> **unauthenticated** — it only answers "who is probably on this segment, and where to reach
+> them"; the connection handshake proves the identity, and the core decides from the device
+> identifier whether a payload may be accepted.
 
 ## Error handling
 
@@ -266,9 +340,18 @@ Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
 |---|---|
 | `InputTooLong` | The input exceeds the boundary limit |
 | `Core` | An error returned by the core, structured as `FfiCoreError { kind, message }` |
-| `Qr` | A failure reported by the channel itself (`kind` + `detail`), such as an image with no code in it |
+| `Qr` | A failure reported by the QR-code half of the channel itself (`kind` + `detail`), such as an image with no code in it |
+| `Lan` | A failure reported by the LAN channel itself (`kind` + `detail`), such as a multicast group that cannot be joined or a peer that was never registered |
 | `InvalidDeviceId` | A device identifier passed in is not 64 hexadecimal characters |
 | `UnknownConflict` | A decision was made for a conflict that is not waiting: a decision belongs to the merge that produced it |
+
+A `Lan` `kind` is a stable identifier just like a `Qr` one. The common values are `lan_socket`
+(the endpoint has no bound socket), `lan_transport` (the runtime or the bind failed),
+`no_connection_to_peer` (the peer was never registered, or cannot be reached),
+`payload_too_large`, `no_lan_peers_found`, `bad_socket` (the address passed in is not
+`ip:port`), and `not_our_lan_address` / `bad_lan_address_length` / `zero_port` for a connection
+record. The enum is `#[non_exhaustive]`, so an unmapped variant reaches the host as
+`lan_error` and a **fallback branch is required**.
 
 `kind` is a **stable machine-readable identifier** (such as `secret_empty`,
 `vault_entry_not_found`) that the host side dispatches its UI on; `message` is for display
