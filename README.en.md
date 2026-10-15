@@ -157,6 +157,26 @@ A login can be completed only once. The second call reports **the same error as 
 was forged"**, and that is deliberate — reporting "already used" on its own would tell a
 replayer that the replay was detected. Host-side wording should stay vague too.
 
+### The two forms of master key storage (`FfiDirectMasterKeyStore` / `FfiWrappedMasterKeyStore`)
+
+The master key has exactly two storage forms on a platform, and **which object you ask is
+the choice — there is no mode argument**:
+
+| Method | Description |
+|---|---|
+| `FfiDirectMasterKeyStore.open()` | Opens the form where the platform store holds the material itself (CNG on Windows, Keystore on Android): `store(label, key)` / `load(label)` / `delete(label)`, and the host side persists nothing for it |
+| `FfiWrappedMasterKeyStore.open()` | Opens the form where the platform store holds a non-exportable key-encryption key: `store(label, key)` **returns the wrapped bytes for the host side to persist**, `load(label, wrapped)` takes them back, and `delete(label)` removes that key (every blob wrapped with it becomes permanently unusable) |
+| `backend()` / `isHardwareBacked()` | Reports truthfully which backend answered (`"tpm"` / `"android-keystore"` / `"software"` / `"secure-enclave"` / `"unavailable"`), so the host side can tell the user before relying on the store |
+
+The master key crosses the boundary **as bytes only** (32 in, 32 out), never in a log and
+never in an error message; once the host side has it, it should drop it at once, or build the
+vault straight from it with `FfiVault.fromMasterKey`. The wrapped form hands back opaque
+bytes: the host side persists them next to the vault file they belong to, and **no operation
+that wraps, unwraps, encrypts, decrypts or hands out a key-encryption key exists in this
+interface** — that is the platform store's own business. A machine with no usable provider
+reports `hardware_unavailable`, a platform with no backend yet reports
+`unsupported_platform`, and **nothing falls back to an in-memory implementation**.
+
 ### Recovery keys
 
 | Function | Description |
@@ -353,6 +373,12 @@ A `Lan` `kind` is a stable identifier just like a `Qr` one. The common values ar
 record. The enum is `#[non_exhaustive]`, so an unmapped variant reaches the host as
 `lan_error` and a **fallback branch is required**.
 
+The master key storage failures carry kinds of their own as well: `invalid_wrapped_key` (the
+wrapped bytes do not unwrap — damaged, or produced by another store entry or another device;
+**never** a different but plausible key), `invalid_master_key`, `key_not_exportable` (the
+platform store took the material but will not hand it back, which is the case that wants the
+wrapped form), `hardware_unavailable` and `unsupported_platform`.
+
 `kind` is a **stable machine-readable identifier** (such as `secret_empty`,
 `vault_entry_not_found`) that the host side dispatches its UI on; `message` is for display
 and logs only. These strings are part of the public interface: **new ones may be added, but
@@ -406,13 +432,16 @@ control.
 
 **The master key** is the same but goes further: on the normal path it **does not cross the
 boundary at all**. `FfiVault` holds it on the Rust side, and reading entries, changing
-entries, computing codes and serializing all happen inside Rust. Only two construction entry
-points need the host side to hand it over or receive it:
+entries, computing codes and serializing all happen inside Rust. Only the entry points below
+need the host side to hand it over or receive it:
 
 - `FfiVault.fromMasterKey(bytes)` / `storeMasterKey(bytes, store)`: after login or recovery
   the host side already has the master key bytes.
 - `FfiJoiner.complete(...)` / `importRecoveryKey(...)`: return the master key bytes so the
   host side can immediately build an `FfiVault` or hand them to the key store.
+- `FfiDirectMasterKeyStore.store` / `load` and `FfiWrappedMasterKeyStore.store` / `load`:
+  the two storage forms, where the material goes in and comes back out as 32 bytes — the
+  wrapped form traded for its own opaque bytes.
 
 Once it has them, the host side should **drop those bytes immediately**. The two callbacks
 `FfiDeviceKeys` / `FfiSecureStore` use bytes rather than structs precisely because the

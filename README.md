@@ -144,6 +144,23 @@ val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 一次登录只能完成一次。第二次调用报的是**与「应答是伪造的」相同的错误**，这是故意
 的——单独报「已经用过了」等于告诉重放者他被认出来了。端侧文案也应保持笼统。
 
+### 主密钥的两种存法（`FfiDirectMasterKeyStore` / `FfiWrappedMasterKeyStore`）
+
+主密钥在平台上只有两种存法，**用哪个对象去问就是选择，没有模式参数**：
+
+| 方法 | 说明 |
+|---|---|
+| `FfiDirectMasterKeyStore.open()` | 打开「平台库直接持有材料」的那一种（Windows 上是 CNG，Android 上是 Keystore）：`store(label, key)` / `load(label)` / `delete(label)`，端侧不为它持久化任何东西 |
+| `FfiWrappedMasterKeyStore.open()` | 打开「平台库持有一把不可导出的 KEK」的那一种：`store(label, key)` **返回要由端侧持久化的包裹字节**，`load(label, wrapped)` 把它们收回来，`delete(label)` 删掉 KEK（先前那些字节随之永久作废） |
+| `backend()` / `isHardwareBacked()` | 如实报告实际答话的后端（`"tpm"` / `"android-keystore"` / `"software"` / `"secure-enclave"` / `"unavailable"`），端侧应在依赖它之前把这一点告诉用户 |
+
+主密钥**只以字节过边界**（32 字节进、32 字节出），既不进日志也不进错误消息；拿到之后
+端侧应立刻丢弃，或直接用 `FfiVault.fromMasterKey` 建保险库。包裹形式交出的字节是不透明
+的：端侧只负责把它们与对应的保险库文件一起持久化，**任何包裹/解包、加解密或取得 KEK
+的操作都不在这层接口里**——那是平台库内部的事。没有可用提供者时报
+`hardware_unavailable`，平台还没有后端时报 `unsupported_platform`，**不会**退化成内存里
+的软件实现。
+
 ### 恢复密钥
 
 | 函数 | 说明 |
@@ -320,6 +337,11 @@ FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 以及连接记录的 `not_our_lan_address` / `bad_lan_address_length` / `zero_port`。枚举是
 `#[non_exhaustive]` 的，未映射的变体一律落到 `lan_error`，因此**兜底分支必须有**。
 
+主密钥两种存法的失败同样各有其 kind：`invalid_wrapped_key`（包裹字节解不开——被损坏，
+或来自另一个库条目、另一台设备；**不会**退回成另一把看起来有效的密钥）、
+`invalid_master_key`、`key_not_exportable`（平台库收下了材料却不肯交出来，这种平台该用
+包裹形式）、`hardware_unavailable`、`unsupported_platform`。
+
 `kind` 是**稳定的机器可读标识**（如 `secret_empty`、`vault_entry_not_found`），
 端侧据此分流 UI；`message` 仅供展示与日志。这些字符串属于公开接口：**可以新增，
 但既有值不得改名**。
@@ -366,13 +388,15 @@ try {
 > **绝不写入日志或持久化**。
 
 **主密钥**同理但更进一步：它正常路径下**根本不过边界**。`FfiVault` 在 Rust 侧持有
-它，读条目、改条目、算验证码、序列化都在 Rust 内完成。只有两个构造入口需要端侧交出
+它，读条目、改条目、算验证码、序列化都在 Rust 内完成。只有下面这几个入口需要端侧交出
 或接收它：
 
 - `FfiVault.fromMasterKey(bytes)` / `storeMasterKey(bytes, store)`：登录或恢复之后，
   端侧手里已经有主密钥字节。
 - `FfiJoiner.complete(...)` / `importRecoveryKey(...)`：返回主密钥字节，供端侧立刻
   建一个 `FfiVault` 或交给密钥库。
+- `FfiDirectMasterKeyStore.store/load` 与 `FfiWrappedMasterKeyStore.store/load`：两种
+  存法，材料以 32 字节进出，包裹形式进出的则是它自己那串不透明字节。
 
 拿到之后端侧应当**立刻丢掉**那些字节。`FfiDeviceKeys` / `FfiSecureStore` 两个回调
 之所以用字节而不是结构体，正是因为主密钥的永久归宿是平台密钥库，而只有端侧能访问
