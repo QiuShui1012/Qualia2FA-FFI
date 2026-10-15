@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
@@ -83,7 +83,7 @@ qualia-transport = { version = "0.1.3", features = ["iroh-lan"] }
 #
 # The crate is published on crates.io, which puts local, CI and third-party
 # consumers on the same source. Both this crate and Core depend on it directly.
-qualia-dik = "0.1.2"
+qualia-dik = "0.1.3"
 
 # Provides the `Display` and `std::error::Error` implementations of `FfiError`.
 # Same major as the version Core uses (2.0.21), so no duplicate version.
@@ -128,4 +128,4 @@ sha2 = "0.11"
 # Test-target only. `mock` is off by default in `qualia-dik` precisely so that a
 # production build cannot carry a key store path with no hardware protection,
 # and the library targets of this crate never enable it.
-qualia-dik = { version = "0.1.2", features = ["mock"] }
+qualia-dik = { version = "0.1.3", features = ["mock"] }
