@@ -2586,10 +2586,11 @@ checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "qualia-dik"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d50c4d5501daca911a6d8ea38d7364174263cfd036b6684baa81daba764d575"
+checksum = "467b5ead95353a113378bd336e1436b961786bd81597169031dc125434f3ace0"
 dependencies = [
+ "getrandom 0.4.3",
  "jni 0.21.1",
  "p256",
  "sha2",

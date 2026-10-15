@@ -74,10 +74,16 @@ qualia-transport = { version = "0.1.3", features = ["iroh-lan"] }
 #
 # A version requirement, matching the version Core uses.
 #
-# The crate is published on crates.io as `qualia-dik 0.1.0`, which puts local,
-# CI and third-party consumers on the same source. Both this crate and Core
-# depend on it directly.
-qualia-dik = "0.1"
+# 0.1.2 is the first release carrying the application's master key store in
+# both of its forms (`DirectMasterKeyStore` / `WrappedMasterKeyStore`), which
+# the objects of this crate are built on. The requirement names that release
+# rather than the `0.1` line: under `0.1` a lockfile that already holds 0.1.1
+# keeps it, and the build then fails on a missing type instead of resolving
+# the version this crate was written against.
+#
+# The crate is published on crates.io, which puts local, CI and third-party
+# consumers on the same source. Both this crate and Core depend on it directly.
+qualia-dik = "0.1.2"
 
 # Provides the `Display` and `std::error::Error` implementations of `FfiError`.
 # Same major as the version Core uses (2.0.21), so no duplicate version.
@@ -113,3 +119,13 @@ uniffi = { version = "=0.29.4", features = ["cli"] }
 # Both are test-target only and are not linked into cdylib/staticlib.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.11"
+
+# The in-memory software backend of the device identity kit, so that the master
+# key store tests can drive both forms of this boundary on every platform: a
+# real platform store exists on Windows and Android only, and a test that skips
+# wherever there is none pins nothing about the marshalling.
+#
+# Test-target only. `mock` is off by default in `qualia-dik` precisely so that a
+# production build cannot carry a key store path with no hardware protection,
+# and the library targets of this crate never enable it.
+qualia-dik = { version = "0.1.2", features = ["mock"] }

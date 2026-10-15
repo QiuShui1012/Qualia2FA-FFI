@@ -60,8 +60,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use qualia_dik::keystore::PlatformKeyStore;
+use qualia_dik::keystore::platform::{PlatformDirectMasterKeyStore, PlatformWrappedMasterKeyStore};
 use qualia_dik::{
     DEVICE_ID_LEN, DeviceId, DeviceKeyStore, DevicePublicKey, DeviceSignature, DeviceSigner,
+    DirectMasterKeyStore, MASTER_KEY_LEN, MasterKey as DikMasterKey, WrappedMasterKey,
+    WrappedMasterKeyStore,
 };
 use qualia_transport::lan::transport::Recipient as LanRecipient;
 use qualia_transport::lan::transport::{IrohLan, MAX_MESSAGE_LEN, PeerAddress};
@@ -205,7 +208,10 @@ pub struct FfiCoreError {
 ///   gets no oracle for "almost succeeded".
 /// - Failures reported by the device identity library are split into
 ///   `device_public_key_invalid`, `device_signature_invalid` and `device_error`
-///   rather than one generic kind.
+///   rather than one generic kind. The master key storage failures carry kinds of
+///   their own — `invalid_wrapped_key`, `invalid_master_key`, `key_not_exportable`,
+///   `hardware_unavailable`, `unsupported_platform` — because each one sends the
+///   host side down a different path.
 /// - The final `_ => "unknown"` arm is **required**: the core's `Error` is
 ///   `#[non_exhaustive]`, so a wildcard arm is mandatory outside its own crate
 ///   (removing it is `E0004`). The price is that the compiler does not flag a newly
@@ -264,6 +270,19 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::Device(qualia_dik::Error::DeviceSignatureInvalid { .. }) => {
             "device_signature_invalid"
         }
+        // ── Master key storage ─────────────────────────────────────────────
+        //
+        // The four ways holding the master key can fail are told apart because the
+        // host side does something different about each of them: a blob that will not
+        // unwrap needs a recovery path, a platform with no backend needs the other
+        // form (or another device), a store that will not hand the material back needs
+        // the wrapped form, and a machine with no usable provider needs the user told.
+        // A fifth kind, `device_error`, still covers every other key store failure.
+        Error::Device(qualia_dik::Error::InvalidWrappedKey { .. }) => "invalid_wrapped_key",
+        Error::Device(qualia_dik::Error::InvalidMasterKey { .. }) => "invalid_master_key",
+        Error::Device(qualia_dik::Error::KeyNotExportable { .. }) => "key_not_exportable",
+        Error::Device(qualia_dik::Error::HardwareUnavailable { .. }) => "hardware_unavailable",
+        Error::Device(qualia_dik::Error::UnsupportedPlatform { .. }) => "unsupported_platform",
         Error::Device(_) => "device_error",
         Error::PairingPayloadMalformed { .. } => "pairing_payload_malformed",
         Error::PairingUnsupportedVersion { .. } => "pairing_unsupported_version",
@@ -1564,13 +1583,342 @@ fn open_platform_key_store() -> Result<PlatformKeyStore, FfiError> {
 ///
 /// The core wraps that error in its own `Error::Device` variant (`#[from]`), so
 /// it reaches the host side with the stable `kind` that [`core_error_kind`]
-/// already assigns to it: `device_public_key_invalid` and
-/// `device_signature_invalid` keep their specific kinds, every other key store
-/// failure is `device_error`. The library's messages are safe to pass on: each
-/// `reason` field is a fixed `&'static str` supplied by the library, never key
-/// material.
+/// already assigns to it: `device_public_key_invalid`, `device_signature_invalid`
+/// and the master key storage failures keep the specific kinds that function
+/// lists, and every other key store failure is `device_error`. The library's
+/// messages are safe to pass on: each `reason` field is a fixed `&'static str`
+/// supplied by the library, never key material.
 fn platform_error(source: qualia_dik::Error) -> FfiError {
     Error::from(source).into()
+}
+
+// ── The master key: the two forms the platform key store offers ──────────
+//
+// The application's master key has two storage forms, and `qualia-dik` models them as two
+// interfaces reached through two constructors. This section mirrors that shape across the
+// boundary instead of inventing a mode argument: the host side chooses a form by opening one
+// object or the other. A review of this section asks the same question the platform key
+// store section asks: **has any judgement been copied in from the library?**
+
+/// The application's master key held **directly** by the platform key store.
+///
+/// The store keeps the material itself (a CNG key on Windows, a Keystore entry on Android)
+/// and the host side persists nothing of its own for it. Reading it back returns the same
+/// 32 bytes.
+///
+/// # The two forms, and how the host side picks one
+///
+/// [`FfiWrappedMasterKeyStore`] is the other form. There is no flag and no mode argument
+/// anywhere in this section: a caller that wants the wrapped form reaches for the other
+/// object, so a platform that implements only one form cannot silently answer for both.
+/// [`FfiDirectMasterKeyStore::backend`] reports what actually answered.
+///
+/// # The master key crosses this boundary as bytes, and as nothing else
+///
+/// [`FfiDirectMasterKeyStore::store`] takes 32 bytes, [`FfiDirectMasterKeyStore::load`]
+/// returns 32 bytes. The material is never formatted, never logged and never part of an
+/// error message; the host side should drop its copy as soon as it has handed the bytes over
+/// or built an [`FfiVault`] from them.
+///
+/// # Current state
+///
+/// Windows and Android have a backend. On every other platform
+/// [`FfiDirectMasterKeyStore::open`] still succeeds — the object is usable and reports
+/// `"unavailable"` — and every operation fails with the kind `unsupported_platform`. Nothing
+/// falls back to an in-process map.
+#[derive(uniffi::Object)]
+pub struct FfiDirectMasterKeyStore {
+    /// The store of this form, held as the interface rather than as the platform's concrete
+    /// type: UniFFI objects cannot be generic, and the tests drive a software backend
+    /// through exactly the methods production calls.
+    store: Box<dyn DirectMasterKeyStore + Send + Sync>,
+}
+
+#[uniffi::export]
+impl FfiDirectMasterKeyStore {
+    /// Opens the direct master key store of the current platform.
+    ///
+    /// # Errors
+    ///
+    /// A [`FfiError::Core`] error with the kind `hardware_unavailable` when no provider on
+    /// this machine can hold master key material. A platform whose backend is not
+    /// implemented yet still opens: the failures arrive from the operations below, with the
+    /// kind `unsupported_platform`, so the host side can name the platform instead of
+    /// reporting a machine that is out of order.
+    #[uniffi::constructor]
+    pub fn open() -> Result<Arc<Self>, FfiError> {
+        let store = open_platform_direct_master_key_store()?;
+        Ok(Self::with_store(Box::new(store)))
+    }
+
+    /// The platform key store that holds the material, as a stable short name: `"tpm"`,
+    /// `"android-keystore"`, `"software"`, `"secure-enclave"` or `"unavailable"`.
+    ///
+    /// Reported **truthfully**, exactly as [`FfiPlatformKeys::backend`] does: asking for it
+    /// opens no key handle, and a machine without a TPM says `"software"` rather than
+    /// pretending. The host side can use it to tell the user before relying on the store.
+    #[must_use]
+    pub fn backend(&self) -> String {
+        self.store.backend().as_str().to_owned()
+    }
+
+    /// Whether the material cannot leave hardware.
+    ///
+    /// Consistent with [`FfiDirectMasterKeyStore::backend`] by construction: `true` exactly
+    /// when that backend is a hardware one.
+    #[must_use]
+    pub fn is_hardware_backed(&self) -> bool {
+        self.store.backend().is_hardware_backed()
+    }
+
+    /// Stores the 32-byte `key` under `label`, replacing what was stored there.
+    ///
+    /// Replacing is deliberate: a recovery or a re-pairing legitimately replaces the master
+    /// key, and refusing would leave the host side unable to follow its own vault files.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] for a label over the boundary limit; the core's
+    /// `master_key_wrong_length` when `key` is not 32 bytes; `key_not_exportable` when the
+    /// platform takes the material but will not hand it back, which is the case that wants
+    /// [`FfiWrappedMasterKeyStore`]; otherwise a key store failure, reported as
+    /// `hardware_unavailable`, `unsupported_platform` or `device_error`.
+    pub fn store(&self, label: String, key: Vec<u8>) -> Result<(), FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        let key = dik_master_key(key)?;
+        DirectMasterKeyStore::store(self.store.as_ref(), &label, &key).map_err(platform_error)
+    }
+
+    /// Reads back the master key stored under `label`: the 32 bytes
+    /// [`FfiDirectMasterKeyStore::store`] was given.
+    ///
+    /// **Never creates or replaces anything**: a label that holds nothing fails instead.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] for an oversized label, and otherwise a key store failure:
+    /// a label that holds nothing is `device_error` today, an unusable platform is
+    /// `unsupported_platform`, and `invalid_master_key` reports a store that returned
+    /// something which is not master key material.
+    pub fn load(&self, label: String) -> Result<Vec<u8>, FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        let key =
+            DirectMasterKeyStore::load(self.store.as_ref(), &label).map_err(platform_error)?;
+        Ok(key.as_bytes().to_vec())
+    }
+
+    /// Deletes the master key stored under `label`.
+    ///
+    /// # Warning
+    ///
+    /// Every vault of that account becomes unreadable on this device unless the key exists
+    /// elsewhere — a recovery key, another device. **The host side has to ask the user
+    /// first.**
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] for an oversized label, and otherwise the same key store
+    /// failures as [`FfiDirectMasterKeyStore::load`].
+    pub fn delete(&self, label: String) -> Result<(), FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        DirectMasterKeyStore::delete(self.store.as_ref(), &label).map_err(platform_error)
+    }
+}
+
+/// The application's master key held **wrapped** by a key-encryption key inside the platform
+/// key store.
+///
+/// The store generates the key-encryption key (a non-exportable CNG key on Windows, an
+/// Android Keystore key on Android), keeps it where nothing can read it out, and wraps the
+/// master key with it. [`FfiWrappedMasterKeyStore::store`] hands back the **wrapped bytes**
+/// for the host side to persist, and [`FfiWrappedMasterKeyStore::load`] takes them back and
+/// returns the master key.
+///
+/// # Nothing here wraps, unwraps or hands out a key-encryption key
+///
+/// Wrapping is the internal design of this form, and the library keeps it that way: no
+/// operation of this object encrypts, decrypts or returns the key-encryption key, and none
+/// is added here. The host side stores a master key and receives bytes to keep; what those
+/// bytes mean is the platform's business.
+///
+/// # The bytes belong to one store entry
+///
+/// Bytes produced by another store entry, or damaged in storage, **fail** rather than unwrap
+/// into a key that merely differs. That is what makes them safe to persist next to the vault
+/// file they belong to. The wrapped form is not secret the way the master key is: whoever
+/// copies the bytes still needs the platform key, which is not in them.
+///
+/// # Current state
+///
+/// Same as [`FfiDirectMasterKeyStore`]: Windows and Android have a backend, and every other
+/// platform reports `unsupported_platform` from every operation.
+#[derive(uniffi::Object)]
+pub struct FfiWrappedMasterKeyStore {
+    /// The store of this form, held as the interface for the reason given on
+    /// [`FfiDirectMasterKeyStore`].
+    store: Box<dyn WrappedMasterKeyStore + Send + Sync>,
+}
+
+#[uniffi::export]
+impl FfiWrappedMasterKeyStore {
+    /// Opens the wrapped master key store of the current platform.
+    ///
+    /// # Errors
+    ///
+    /// A [`FfiError::Core`] error with the kind `hardware_unavailable` when this machine has
+    /// no provider that can create a key-encryption key; see
+    /// [`FfiDirectMasterKeyStore::open`] for why an unimplemented platform opens anyway.
+    #[uniffi::constructor]
+    pub fn open() -> Result<Arc<Self>, FfiError> {
+        let store = open_platform_wrapped_master_key_store()?;
+        Ok(Self::with_store(Box::new(store)))
+    }
+
+    /// The platform key store that holds the key-encryption key, as a stable short name:
+    /// `"tpm"`, `"android-keystore"`, `"software"`, `"secure-enclave"` or `"unavailable"`.
+    ///
+    /// Reported truthfully, like [`FfiDirectMasterKeyStore::backend`]; this is the value the
+    /// host side tells the user about before it relies on the wrapped form.
+    #[must_use]
+    pub fn backend(&self) -> String {
+        self.store.backend().as_str().to_owned()
+    }
+
+    /// Whether the key-encryption key cannot leave hardware.
+    ///
+    /// Consistent with [`FfiWrappedMasterKeyStore::backend`] by construction: `true` exactly
+    /// when that backend is a hardware one.
+    #[must_use]
+    pub fn is_hardware_backed(&self) -> bool {
+        self.store.backend().is_hardware_backed()
+    }
+
+    /// Wraps the 32-byte `key` under `label` and returns the **bytes the host side has to
+    /// persist**.
+    ///
+    /// The bytes are opaque: their length and contents belong to the platform, and only the
+    /// same store entry can turn them back into the master key. Persist them next to the
+    /// vault file they belong to; losing them means the master key has to be recovered
+    /// another way, and deleting the label's entry makes them permanently unusable.
+    ///
+    /// Wrapping under a label that already exists reuses the key-encryption key that is
+    /// already there, so bytes persisted earlier keep unwrapping.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] for an oversized label; the core's
+    /// `master_key_wrong_length` when `key` is not 32 bytes; otherwise a key store failure,
+    /// reported as `unsupported_platform` or `device_error` — a platform that cannot create
+    /// a key-encryption key included.
+    pub fn store(&self, label: String, key: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        let key = dik_master_key(key)?;
+        let wrapped = WrappedMasterKeyStore::store(self.store.as_ref(), &label, &key)
+            .map_err(platform_error)?;
+        Ok(wrapped.into_bytes())
+    }
+
+    /// Unwraps `wrapped` — the bytes [`FfiWrappedMasterKeyStore::store`] handed back for
+    /// `label` — and returns the master key.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_wrapped_key` when the bytes do not unwrap: a damaged blob, or one produced
+    /// by another store entry or another device. **The method never returns bytes it could
+    /// not authenticate**, so a failure here means "these bytes are unusable", not "here is
+    /// a different key". A label that holds no key-encryption key at all is `device_error`
+    /// today.
+    pub fn load(&self, label: String, wrapped: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        let wrapped = WrappedMasterKey::from_bytes(wrapped);
+        let key = WrappedMasterKeyStore::load(self.store.as_ref(), &label, &wrapped)
+            .map_err(platform_error)?;
+        Ok(key.as_bytes().to_vec())
+    }
+
+    /// Deletes the key-encryption key stored under `label`.
+    ///
+    /// # Warning
+    ///
+    /// Every blob wrapped with that key becomes permanently unusable, which is how a device
+    /// forgets a master key. **The host side has to ask the user first**, and it has to be
+    /// prepared for the persisted bytes to be worthless afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InputTooLong`] for an oversized label, and otherwise the same key store
+    /// failures as [`FfiWrappedMasterKeyStore::load`].
+    pub fn delete(&self, label: String) -> Result<(), FfiError> {
+        check_len("label", &label, MAX_LABEL_CHARS)?;
+        WrappedMasterKeyStore::delete(self.store.as_ref(), &label).map_err(platform_error)
+    }
+}
+
+/// Helpers of the master key store objects that are **not** exported.
+///
+/// Separate `impl` blocks on purpose: `#[uniffi::export]` lowers every method of the block
+/// it is attached to, and it cannot generate cross-boundary code for a
+/// `Box<dyn DirectMasterKeyStore>` or a `Box<dyn WrappedMasterKeyStore>`.
+impl FfiDirectMasterKeyStore {
+    /// Wraps a store in the exported object.
+    fn with_store(store: Box<dyn DirectMasterKeyStore + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+}
+
+impl FfiWrappedMasterKeyStore {
+    /// Wraps a store in the exported object.
+    fn with_store(store: Box<dyn WrappedMasterKeyStore + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+}
+
+/// Opens the direct master key store of the current platform.
+///
+/// The `cfg` split is the one [`open_platform_key_store`] documents: opening a platform
+/// store is fallible where the platform has one, and the placeholder compiled on the
+/// remaining platforms cannot fail.
+fn open_platform_direct_master_key_store() -> Result<PlatformDirectMasterKeyStore, FfiError> {
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    {
+        PlatformDirectMasterKeyStore::open_best_available().map_err(platform_error)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    {
+        Ok(PlatformDirectMasterKeyStore::open_best_available())
+    }
+}
+
+/// Opens the wrapped master key store of the current platform; see
+/// [`open_platform_direct_master_key_store`] for the `cfg` split.
+fn open_platform_wrapped_master_key_store() -> Result<PlatformWrappedMasterKeyStore, FfiError> {
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    {
+        PlatformWrappedMasterKeyStore::open_best_available().map_err(platform_error)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    {
+        Ok(PlatformWrappedMasterKeyStore::open_best_available())
+    }
+}
+
+/// Converts the bytes of a master key handed across the boundary into the library's type.
+///
+/// The library takes the material as a fixed-size array, so its length is checked by the
+/// conversion itself. A wrong length is reported as the core's `master_key_wrong_length` —
+/// the kind the host side already dispatches on for [`FfiVault::from_master_key`] — rather
+/// than as a kind of its own. Both sides agree on the length by construction: the constant
+/// used here is the library's, and it is the same 32 bytes the core's vault layer uses.
+fn dik_master_key(bytes: Vec<u8>) -> Result<DikMasterKey, FfiError> {
+    <[u8; MASTER_KEY_LEN]>::try_from(bytes)
+        .map(DikMasterKey::from_bytes)
+        .map_err(|bytes: Vec<u8>| {
+            Error::MasterKeyWrongLength {
+                expected: MASTER_KEY_LEN,
+                actual: bytes.len(),
+            }
+            .into()
+        })
 }
 
 /// A 2FA entry, as represented across the FFI boundary.
@@ -3767,6 +4115,7 @@ fn lan_error(source: qualia_transport::Error) -> FfiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qualia_dik::{MockDirectMasterKeyStore, MockWrappedMasterKeyStore};
 
     #[test]
     fn a_qr_code_survives_encoding_and_decoding() {
@@ -4410,6 +4759,27 @@ mod tests {
                 limit: 10,
             }),
             core_error_kind(&Error::TransportUnsupported { operation: "test" }),
+            // The master key storage failures of the device identity library. Each one sends
+            // the host side somewhere different, so each one needs a kind of its own: a blob
+            // that will not unwrap wants a recovery path, a platform with no backend wants
+            // the other form, a store that will not hand the material back wants the wrapped
+            // form, and a machine with no usable provider has to be told to the user.
+            core_error_kind(&Error::Device(qualia_dik::Error::InvalidWrappedKey {
+                reason: "test",
+                code: 0,
+            })),
+            core_error_kind(&Error::Device(qualia_dik::Error::InvalidMasterKey {
+                reason: "test",
+            })),
+            core_error_kind(&Error::Device(qualia_dik::Error::KeyNotExportable {
+                reason: "test",
+            })),
+            core_error_kind(&Error::Device(qualia_dik::Error::HardwareUnavailable {
+                reason: String::from("test"),
+            })),
+            core_error_kind(&Error::Device(qualia_dik::Error::UnsupportedPlatform {
+                platform: "test",
+            })),
         ];
         for kind in kinds {
             assert_ne!(kind, "unknown", "a variant is not mapped to a stable kind");
@@ -4524,6 +4894,227 @@ mod tests {
 
         DeviceKeyStore::delete(&keys.store, label.as_str())
             .expect("the test identity should be removable");
+    }
+
+    // ── Master key storage, both forms ───────────────────────────────
+
+    /// The material the master key tests store and expect back.
+    ///
+    /// A fixed pattern rather than random bytes: every test here compares what came back with
+    /// what went in, and a value that changed per run would hide a wrong-bytes result behind
+    /// a comparison that never had a chance to fail.
+    const TEST_MASTER_KEY: [u8; MASTER_KEY_LEN] = [0x5A; MASTER_KEY_LEN];
+
+    /// A direct store over the software backend.
+    ///
+    /// The platform stores of both forms exist on Windows and Android only, so a test driving
+    /// a real one would **skip on every other platform, CI included**, and pin nothing about
+    /// the marshalling. The software backend is reached through exactly the methods
+    /// production calls, and it reports `"software"` honestly.
+    fn direct_store() -> Arc<FfiDirectMasterKeyStore> {
+        FfiDirectMasterKeyStore::with_store(Box::new(MockDirectMasterKeyStore::new()))
+    }
+
+    /// A wrapped store over the software backend.
+    fn wrapped_store() -> Arc<FfiWrappedMasterKeyStore> {
+        FfiWrappedMasterKeyStore::with_store(Box::new(MockWrappedMasterKeyStore::new()))
+    }
+
+    /// The direct form round-trips, and deleting the key ends it.
+    #[test]
+    fn the_direct_master_key_round_trips_across_the_boundary() {
+        let store = direct_store();
+        let label = String::from("direct-master-key");
+
+        assert_eq!(
+            store.backend(),
+            "software",
+            "the store must report the backend that answered"
+        );
+        assert!(
+            !store.is_hardware_backed(),
+            "a software backend must not be reported as hardware backed"
+        );
+
+        store
+            .store(label.clone(), TEST_MASTER_KEY.to_vec())
+            .expect("storing the material should succeed");
+        assert_eq!(
+            store
+                .load(label.clone())
+                .expect("the material should be readable"),
+            TEST_MASTER_KEY.to_vec(),
+            "the direct form returned material other than what was stored"
+        );
+
+        store
+            .delete(label.clone())
+            .expect("deleting the key should succeed");
+        assert!(
+            store.load(label.clone()).is_err(),
+            "the key is still readable after it was deleted"
+        );
+    }
+
+    /// The wrapped form hands back the bytes to persist, and takes them back.
+    #[test]
+    fn the_wrapped_master_key_round_trips_across_the_boundary() {
+        let store = wrapped_store();
+        let label = String::from("wrapped-master-key");
+
+        assert_eq!(
+            store.backend(),
+            "software",
+            "the store must report the backend that answered"
+        );
+        assert!(
+            !store.is_hardware_backed(),
+            "a software backend must not be reported as hardware backed"
+        );
+
+        let wrapped = store
+            .store(label.clone(), TEST_MASTER_KEY.to_vec())
+            .expect("wrapping the material should succeed");
+        assert!(
+            !wrapped.is_empty() && wrapped != TEST_MASTER_KEY.to_vec(),
+            "the wrapped form has to be bytes of its own, not the material"
+        );
+
+        assert_eq!(
+            store
+                .load(label.clone(), wrapped.clone())
+                .expect("the wrapped bytes should unwrap"),
+            TEST_MASTER_KEY.to_vec(),
+            "the wrapped form returned material other than what was stored"
+        );
+        // These bytes are what the host persists, so they have to keep working.
+        assert_eq!(
+            store
+                .load(label.clone(), wrapped.clone())
+                .expect("the wrapped bytes should unwrap again"),
+            TEST_MASTER_KEY.to_vec(),
+            "the wrapped bytes stopped unwrapping after a first use"
+        );
+
+        store
+            .delete(label.clone())
+            .expect("deleting the key-encryption key should succeed");
+        assert!(
+            store.load(label.clone(), wrapped).is_err(),
+            "the wrapped bytes still unwrap after the key-encryption key was deleted"
+        );
+    }
+
+    /// A damaged or foreign blob is refused, never turned into some other key.
+    #[test]
+    fn a_wrapped_blob_that_does_not_unwrap_is_refused() {
+        let store = wrapped_store();
+        let label = String::from("damaged-wrapped-key");
+        let mut wrapped = store
+            .store(label.clone(), TEST_MASTER_KEY.to_vec())
+            .expect("wrapping the material should succeed");
+
+        // The last byte belongs to the authentication tag: changing it leaves the length and
+        // every other byte in place, which is the shape of a blob damaged in storage.
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0x01;
+        let error = store
+            .load(label.clone(), wrapped)
+            .expect_err("a damaged blob must not unwrap");
+        assert_eq!(
+            error.kind(),
+            "invalid_wrapped_key",
+            "a damaged blob has to be reported as such rather than as a store failure"
+        );
+
+        // A truncated blob is refused as well rather than padded into 32 bytes.
+        let error = store
+            .load(label.clone(), vec![0_u8; 8])
+            .expect_err("a truncated blob must not unwrap");
+        assert_eq!(
+            error.kind(),
+            "invalid_wrapped_key",
+            "a truncated blob has to be reported as such"
+        );
+
+        // Bytes from another store entry do not unwrap either: the key-encryption key
+        // differs, so accepting them would hand back a key that merely looks valid.
+        let other = String::from("another-wrapped-key");
+        store
+            .store(other.clone(), [0x11_u8; MASTER_KEY_LEN].to_vec())
+            .expect("the second entry should wrap");
+        let foreign = store
+            .store(other, TEST_MASTER_KEY.to_vec())
+            .expect("the second entry should wrap again");
+        let error = store
+            .load(label, foreign)
+            .expect_err("bytes of another store entry must not unwrap");
+        assert_eq!(
+            error.kind(),
+            "invalid_wrapped_key",
+            "bytes of another store entry have to be refused"
+        );
+    }
+
+    /// Neither the material nor the blob it was wrapped into reaches an error message.
+    #[test]
+    fn master_key_material_never_reaches_an_error_message() {
+        let store = wrapped_store();
+        let label = String::from("material-in-messages");
+        let material = [0xA5_u8; MASTER_KEY_LEN];
+        let wrapped = store
+            .store(label.clone(), material.to_vec())
+            .expect("wrapping the material should succeed");
+
+        let mut damaged = wrapped.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0x01;
+        let error = store
+            .load(label, damaged)
+            .expect_err("a damaged blob must not unwrap");
+
+        let rendered = format!("{error} | {error:?}");
+        for leak in [
+            to_hex(&material),
+            format!("{material:?}"),
+            to_hex(&wrapped),
+            format!("{wrapped:?}"),
+        ] {
+            assert!(
+                !rendered.contains(&leak),
+                "an error message carries master key material or the blob wrapping it: {rendered}"
+            );
+        }
+    }
+
+    /// The boundary's own limits are enforced before anything else is done with the input.
+    #[test]
+    fn an_oversized_label_is_rejected_before_the_master_key_store_is_reached() {
+        let store = direct_store();
+        // Both inputs are wrong. If the label limit did not come first, the report would be
+        // about the key length instead, and a label the store forbids would have been passed
+        // on to be judged there.
+        let error = store
+            .store("a".repeat(MAX_LABEL_CHARS + 1), vec![0_u8; 1])
+            .expect_err("an oversized label must be rejected");
+        assert_eq!(error.kind(), "input_too_long");
+    }
+
+    /// A master key of the wrong length is refused with the core's own kind.
+    #[test]
+    fn a_master_key_of_the_wrong_length_is_refused() {
+        let store = direct_store();
+        let error = store
+            .store(
+                String::from("short-master-key"),
+                vec![0_u8; MASTER_KEY_LEN - 1],
+            )
+            .expect_err("a short master key must be refused");
+        assert_eq!(
+            error.kind(),
+            "master_key_wrong_length",
+            "a wrong length has to be reported with the kind the vault paths already use"
+        );
     }
 
     // ── Synchronization across the boundary ──────────────────────────
