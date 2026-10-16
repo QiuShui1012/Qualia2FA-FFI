@@ -56,9 +56,40 @@ jobs:
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --locked
 
+  # The package can be perfectly valid Rust and still be unusable: the host-side bindings are
+  # generated from the compiled library's metadata, and a constructor whose return type the
+  # generator refuses is not a compile error in this crate. That is exactly how a release once
+  # went out whose bindings could not be generated at all, so the packaging gate generates them
+  # too. The recipe is a copy of the `CI` workflow's job: a tag-triggered run does not depend on
+  # a branch run, so a red CI cannot stop a publish on its own.
+  bindings:
+    name: Generate the bindings
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # `--all-targets` is required: `--bin uniffi-bindgen` builds only that binary and produces
+      # no cdylib, while the generator reads `target/debug/qualia2fa_ffi.dll`.
+      - name: Build the library and the binding generator
+        run: cargo build --locked --all-targets
+
+      - name: Generate the Kotlin bindings
+        shell: pwsh
+        run: |
+          cargo run --bin uniffi-bindgen -- generate `
+            --library target/debug/qualia2fa_ffi.dll `
+            --language kotlin --out-dir "$env:RUNNER_TEMP/bindings"
+          $kt = Get-ChildItem -Path "$env:RUNNER_TEMP/bindings" `
+                -Recurse -Filter 'qualia2fa_ffi.kt' | Select-Object -First 1
+          if (-not $kt) { throw "Kotlin binding file was not generated" }
+          Write-Host "Generated: $($kt.FullName) ($($kt.Length) B)"
+
   publish:
     name: Publish to crates.io
-    needs: verify
+    needs: [verify, bindings]
     # A manual trigger (workflow_dispatch) only runs verification, never publishing.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

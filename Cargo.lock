@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-ffi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "p256",
  "qualia-dik",

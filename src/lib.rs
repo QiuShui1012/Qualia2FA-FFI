@@ -3816,7 +3816,7 @@ impl From<SharePlan> for FfiSharePlan {
 
 /// An export format the host side can name.
 ///
-/// [`FfiImport::detect_format`] answers the same question from the content, which is what a file
+/// [`detect_import_format`] answers the same question from the content, which is what a file
 /// the user picked needs: the extension is a hint, not evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiImportFormat {
@@ -4041,20 +4041,6 @@ impl FfiImport {
         Ok(Arc::new(Self { report }))
     }
 
-    /// Guesses the format from the content of a file.
-    ///
-    /// Returns `None` when it is not recognisable; the host side should then ask the user, which
-    /// costs one question and avoids reading a file as the wrong format.
-    #[uniffi::constructor]
-    #[must_use]
-    pub fn detect_format(bytes: Vec<u8>) -> Option<FfiImportFormat> {
-        match qualia2fa_core::import::ImportFormat::detect(&bytes)? {
-            qualia2fa_core::import::ImportFormat::Json => Some(FfiImportFormat::Json),
-            qualia2fa_core::import::ImportFormat::Html => Some(FfiImportFormat::Html),
-            qualia2fa_core::import::ImportFormat::Text => Some(FfiImportFormat::Text),
-        }
-    }
-
     /// The entries that could be read, in the order the export listed them.
     #[must_use]
     pub fn entries(&self) -> Vec<FfiImportedEntry> {
@@ -4196,6 +4182,23 @@ impl FfiImport {
     }
 }
 
+/// Guesses the format of an export from its content.
+///
+/// Returns `None` when it is not recognisable; the host side should then ask the user, which costs
+/// one question and avoids reading a file as the wrong format.
+///
+/// A **free function** rather than a method on [`FfiImport`]: it answers a question about some
+/// bytes rather than building the object, and UniFFI 0.29 exports neither an associated function
+/// nor a constructor that returns something other than `Self`.
+#[uniffi::export]
+#[must_use]
+pub fn detect_import_format(bytes: Vec<u8>) -> Option<FfiImportFormat> {
+    match qualia2fa_core::import::ImportFormat::detect(&bytes)? {
+        qualia2fa_core::import::ImportFormat::Json => Some(FfiImportFormat::Json),
+        qualia2fa_core::import::ImportFormat::Html => Some(FfiImportFormat::Html),
+        qualia2fa_core::import::ImportFormat::Text => Some(FfiImportFormat::Text),
+    }
+}
 /// What the user decided about one conflict.
 ///
 /// Mirrors [`qualia2fa_core::sync::Decision`].
@@ -5849,7 +5852,7 @@ mod tests {
                       otpauth://totp/Bank:bob?secret=KRSXG5CTMVRXEZLU&issuer=Bank\n";
 
         assert_eq!(
-            FfiImport::detect_format(export.as_bytes().to_vec()),
+            detect_import_format(export.as_bytes().to_vec()),
             Some(FfiImportFormat::Text)
         );
         let import =
