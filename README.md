@@ -362,6 +362,9 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
   两端必须一起升级。
 - **依赖 `qualia2fa-core 0.2.1`**（自 0.2.3 起）：`export` 与它的三个格式函数是这一版新增的；
   0.2.1 也是 HTML 读取端能从二维码里取出步长的那一版，两者配套。
+- **依赖 `qualia2fa-core 0.2.2`**（自 0.2.4 起）：HTML 导出的三个单元格改成 Aegis 实际写的
+  那样——类型写成大写、收藏栏写 `false`、没人填的字段留**空单元格**（只有对这条条目不适用
+  的字段才写 `-`）。读取端一直两种都认，改动只影响写出去的文件长什么样。
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 

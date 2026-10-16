@@ -407,6 +407,11 @@ Three things a caller has to know:
 - **Depends on `qualia2fa-core 0.2.1`** (since 0.2.3): `export` and its three format functions are
   new here, and 0.2.1 is also the release whose HTML reader takes the time step out of the QR
   code - the two belong together.
+- **Depends on `qualia2fa-core 0.2.2`** (since 0.2.4): three cells of the HTML export are spelled
+  the way Aegis spells them - the type in upper case, the favourite column as the word, and an
+  **empty cell** for a field nobody filled in (the dash belongs to a field that does not apply to
+  the entry's type). The reader accepted both spellings all along, so this only changes what a
+  written file looks like.
 
 Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
 
