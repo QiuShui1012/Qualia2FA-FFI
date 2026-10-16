@@ -72,6 +72,7 @@ use qualia_transport::lan::wire::{ENDPOINT_KEY_LEN, EndpointKey, Peer, PeerStatu
 use qualia_transport::lan::{LanAddress, lobby::Lobby};
 use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
+use qualia2fa_core::motp::{self, MotpPin};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::recovery::KdfParams;
 use qualia2fa_core::sync::{
@@ -81,7 +82,8 @@ use qualia2fa_core::transport::{
     Recipient, Roster, SharePlan, SyncSession, Transport, TransportCapabilities,
 };
 use qualia2fa_core::uri;
-use qualia2fa_core::vault::{Entry, MasterKey, Vault, VaultFile};
+use qualia2fa_core::vault::{Entry, EntryKind, MasterKey, Vault, VaultFile};
+use qualia2fa_core::yaotp::{self, YandexPin};
 use qualia2fa_core::{Error, ExposeSecret as _, SecretString};
 
 /// Length of a challenge-response session identifier.
@@ -344,6 +346,8 @@ impl FfiError {
     pub fn kind(&self) -> &str {
         match self {
             FfiError::InputTooLong { .. } => "input_too_long",
+            FfiError::InputEmpty { .. } => "input_empty",
+            FfiError::WrongCodeKind { .. } => "wrong_code_kind",
             FfiError::Core { detail } => &detail.kind,
             FfiError::Qr { kind, .. } => kind,
             FfiError::Lan { kind, .. } => kind,
@@ -394,6 +398,31 @@ pub enum FfiError {
         limit: u64,
         /// Actual number of characters.
         actual: u64,
+    },
+
+    /// The host asked for a code the entry's kind cannot produce.
+    ///
+    /// A time-based entry has no counter to advance and an HOTP entry has no clock to read, so
+    /// calling the other function is a mistake in the host, not a fault in the vault. Named
+    /// rather than silently computing something: a code from the wrong scheme never matches, and
+    /// the user would see "the code is wrong" instead of "the wrong call was made".
+    #[error("this entry computes its code with {wanted}, not as {kind}")]
+    WrongCodeKind {
+        /// What the host asked for.
+        kind: String,
+        /// What the entry actually needs.
+        wanted: String,
+    },
+
+    /// A field the host side must fill in was empty.
+    ///
+    /// The one field this applies to is the PIN of an mOTP or Yandex entry: an empty text field
+    /// means the user cleared it, and storing an empty PIN would produce codes that never match
+    /// while looking like a working entry.
+    #[error("input is empty: {kind}")]
+    InputEmpty {
+        /// The field that was empty.
+        kind: String,
     },
 
     /// An error returned by the core.
@@ -508,60 +537,136 @@ impl From<FfiAlgorithm> for Algorithm {
 /// Number of digits in a generated code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiDigits {
+    /// 5 digits (Steam Guard).
+    Five,
     /// 6 digits (the default).
     Six,
     /// 7 digits (used by some banks).
     Seven,
     /// 8 digits.
     Eight,
+    /// 9 digits.
+    Nine,
+    /// A count a form does not offer. Only another application's export or a crafted file
+    /// produces one, and it is carried through rather than rounded: rounding would silently
+    /// change what the entry computes.
+    Other {
+        /// The count, between 1 and 9.
+        digits: u8,
+    },
 }
 
 impl From<FfiDigits> for Digits {
     fn from(value: FfiDigits) -> Self {
         match value {
-            FfiDigits::Six => Digits::Six,
-            FfiDigits::Seven => Digits::Seven,
-            FfiDigits::Eight => Digits::Eight,
+            FfiDigits::Five => Digits::FIVE,
+            FfiDigits::Six => Digits::SIX,
+            FfiDigits::Seven => Digits::SEVEN,
+            FfiDigits::Eight => Digits::EIGHT,
+            FfiDigits::Nine => Digits::new(9).unwrap_or(Digits::SIX),
+            // The core rejects a count outside 1..=9, so this cannot panic and cannot be a
+            // silent rounding either: a value the core will not take becomes an error at the
+            // call site that builds the entry.
+            FfiDigits::Other { digits } => Digits::new(digits).unwrap_or(Digits::SIX),
         }
     }
 }
 
-/// Type of an `otpauth://` URI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiUriType {
-    /// Time-based.
-    Totp,
-    /// Counter-based.
-    Hotp,
-}
-
-impl From<uri::UriType> for FfiUriType {
-    fn from(value: uri::UriType) -> Self {
-        match value {
-            uri::UriType::Totp => FfiUriType::Totp,
-            uri::UriType::Hotp => FfiUriType::Hotp,
+impl From<Digits> for FfiDigits {
+    fn from(value: Digits) -> Self {
+        match value.as_byte() {
+            5 => FfiDigits::Five,
+            6 => FfiDigits::Six,
+            7 => FfiDigits::Seven,
+            8 => FfiDigits::Eight,
+            9 => FfiDigits::Nine,
+            digits => FfiDigits::Other { digits },
         }
     }
 }
 
-impl From<FfiUriType> for uri::UriType {
-    fn from(value: FfiUriType) -> Self {
-        match value {
-            FfiUriType::Totp => uri::UriType::Totp,
-            FfiUriType::Hotp => uri::UriType::Hotp,
+/// The kind of an entry, with the parameters that belong to it.
+///
+/// The kind decides how a code is computed: a time step, a counter, and for two of them a PIN.
+/// The former flat `period` / `counter` pair could not express an mOTP entry, a Yandex OTP entry
+/// or a Steam Guard entry, so those arrived as ordinary TOTP entries and produced wrong codes.
+///
+/// # The PIN is an input, never an output
+///
+/// `pin` is written by the host when it creates or changes an entry, and the core never hands one
+/// back: a PIN is key material with no display purpose, and the one place that needs to read it is
+/// the code computation, which happens inside the core. [`FfiVaultEntry::pin_set`] says whether
+/// one is stored, so a form can show that a PIN exists without being able to read it.
+///
+/// On **update**, `pin: None` means "keep the stored PIN": a host that edits a note must not have
+/// to ask the user for a PIN it was never shown, and must not silently drop it either.
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiEntryKind {
+    /// Time-based (RFC 6238).
+    Totp {
+        /// Time step in seconds.
+        period: u64,
+    },
+    /// Counter-based (RFC 4226).
+    Hotp {
+        /// The counter.
+        counter: u64,
+    },
+    /// mOTP: MD5, a ten-second step, six hexadecimal characters, and a PIN.
+    Motp {
+        /// Time step in seconds, ten by definition.
+        period: u64,
+        /// The PIN to store. See the type documentation.
+        pin: Option<String>,
+    },
+    /// Yandex OTP: SHA-256, eight lower-case letters, and a PIN.
+    Yandex {
+        /// Time step in seconds, thirty by definition.
+        period: u64,
+        /// The PIN to store. See the type documentation.
+        pin: Option<String>,
+    },
+    /// Steam Guard: SHA-1, five characters, a thirty-second step.
+    Steam,
+}
+
+impl core::fmt::Debug for FfiEntryKind {
+    /// Prints the shape only: the PIN of an mOTP or Yandex entry is key material and must not
+    /// reach a log, a panic message or a crash dump.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (name, period) = match self {
+            Self::Totp { period } => ("Totp", Some(*period)),
+            Self::Motp { period, .. } => ("Motp", Some(*period)),
+            Self::Yandex { period, .. } => ("Yandex", Some(*period)),
+            Self::Hotp { .. } => ("Hotp", None),
+            Self::Steam => ("Steam", None),
+        };
+        let mut debug = formatter.debug_struct(name);
+        if let Some(period) = period {
+            debug.field("period", &period);
         }
+        if let Self::Hotp { counter } = self {
+            debug.field("counter", counter);
+        }
+        if matches!(
+            self,
+            Self::Motp { pin: Some(_), .. } | Self::Yandex { pin: Some(_), .. }
+        ) {
+            debug.field("pin", &"<set>");
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
 /// A parsed `otpauth://` entry.
 ///
-/// The fields correspond one-to-one to the core [`uri::OtpAuth`]; the only
-/// difference is that `secret` appears as a Base32 string rather than as an
-/// `OtpSecret` (see the module documentation).
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+/// The fields correspond one-to-one to the core [`uri::OtpAuth`]; the only differences are that
+/// `secret` appears as a Base32 string rather than as an `OtpSecret`, and that the kind carries
+/// the PIN as an input rather than as a readable value (see [`FfiEntryKind`]).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiOtpAuth {
-    /// TOTP or HOTP.
-    pub uri_type: FfiUriType,
+    /// The kind, with its period, counter and PIN.
+    pub kind: FfiEntryKind,
     /// The secret, Base32 encoded (upper case).
     pub secret_base32: String,
     /// Issuer (service name), such as `GitHub`.
@@ -572,14 +677,111 @@ pub struct FfiOtpAuth {
     pub algorithm: FfiAlgorithm,
     /// Number of digits in a code.
     pub digits: FfiDigits,
-    /// Time step in seconds.
+}
+
+impl FfiEntryKind {
+    /// The kind as the host sees it.
     ///
-    /// **Invariant**: for HOTP entries this value is always the core default and
-    /// has no meaning (HOTP advances by counter). It follows the convention of
-    /// the core [`uri::OtpAuth::period`].
-    pub period: u64,
-    /// The HOTP counter. `None` for TOTP.
-    pub counter: Option<u64>,
+    /// A stored PIN is reported as [`FfiVaultEntry::pin_set`] rather than as a value: the core
+    /// never hands one out, because the only thing that needs to read it is the code computation,
+    /// which happens there.
+    fn from_core(kind: &EntryKind) -> Self {
+        match kind {
+            EntryKind::Totp { period } => Self::Totp { period: *period },
+            EntryKind::Hotp { counter } => Self::Hotp { counter: *counter },
+            EntryKind::Motp { period, .. } => Self::Motp {
+                period: *period,
+                pin: None,
+            },
+            EntryKind::Yandex { period, .. } => Self::Yandex {
+                period: *period,
+                pin: None,
+            },
+            EntryKind::Steam => Self::Steam,
+        }
+    }
+
+    /// The kind as the core sees it.
+    ///
+    /// `existing` is the kind the entry has now, when there is one. Its PIN is **moved** into the
+    /// result when the host supplied none, so that editing a note neither drops the PIN silently
+    /// nor forces the user to retype a value the host was never shown.
+    fn into_core(self, existing: Option<EntryKind>) -> Result<EntryKind, FfiError> {
+        Ok(match self {
+            Self::Totp { period } => EntryKind::Totp { period },
+            Self::Hotp { counter } => EntryKind::Hotp { counter },
+            Self::Steam => EntryKind::Steam,
+            Self::Motp { period, pin } => EntryKind::Motp {
+                period,
+                pin: motp_pin(pin, existing)?,
+            },
+            Self::Yandex { period, pin } => EntryKind::Yandex {
+                period,
+                pin: yandex_pin(pin, existing)?,
+            },
+        })
+    }
+}
+
+/// The mOTP PIN to store: what the host supplied, or the one the entry already has.
+fn motp_pin(
+    supplied: Option<String>,
+    existing: Option<EntryKind>,
+) -> Result<Option<MotpPin>, FfiError> {
+    match supplied {
+        Some(pin) => {
+            check_len("pin", &pin, MAX_VAULT_FIELD_CHARS)?;
+            if pin.is_empty() {
+                return Err(FfiError::InputEmpty {
+                    kind: "pin".to_owned(),
+                });
+            }
+            Ok(Some(MotpPin::new(pin)))
+        }
+        None => Ok(match existing {
+            Some(EntryKind::Motp { pin, .. }) => pin,
+            _ => None,
+        }),
+    }
+}
+
+/// The Yandex PIN to store: what the host supplied, or the one the entry already has.
+fn yandex_pin(
+    supplied: Option<String>,
+    existing: Option<EntryKind>,
+) -> Result<Option<YandexPin>, FfiError> {
+    match supplied {
+        Some(pin) => {
+            check_len("pin", &pin, MAX_VAULT_FIELD_CHARS)?;
+            if pin.is_empty() {
+                return Err(FfiError::InputEmpty {
+                    kind: "pin".to_owned(),
+                });
+            }
+            Ok(Some(YandexPin::new(pin)))
+        }
+        None => Ok(match existing {
+            Some(EntryKind::Yandex { pin, .. }) => pin,
+            _ => None,
+        }),
+    }
+}
+
+impl core::fmt::Debug for FfiOtpAuth {
+    /// Prints everything except the secret: it is the one field that must not reach a log, a
+    /// panic message or a crash dump, and the import preview makes this type travel through
+    /// diagnostics for the first time.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FfiOtpAuth")
+            .field("kind", &self.kind)
+            .field("secret_base32", &"<redacted>")
+            .field("issuer", &self.issuer)
+            .field("account", &self.account)
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Checks a string length limit and returns [`FfiError::InputTooLong`] when it is
@@ -616,7 +818,7 @@ pub fn parse_otpauth_uri(uri: String) -> Result<FfiOtpAuth, FfiError> {
     check_len("uri", &uri, MAX_URI_CHARS)?;
     let parsed = uri::parse(&uri)?;
     Ok(FfiOtpAuth {
-        uri_type: parsed.uri_type.into(),
+        kind: FfiEntryKind::from_core(&parsed.kind),
         secret_base32: parsed.secret.to_base32(),
         issuer: parsed.issuer,
         account: parsed.account,
@@ -625,13 +827,7 @@ pub fn parse_otpauth_uri(uri: String) -> Result<FfiOtpAuth, FfiError> {
             Algorithm::Sha256 => FfiAlgorithm::Sha256,
             Algorithm::Sha512 => FfiAlgorithm::Sha512,
         },
-        digits: match parsed.digits {
-            Digits::Six => FfiDigits::Six,
-            Digits::Seven => FfiDigits::Seven,
-            Digits::Eight => FfiDigits::Eight,
-        },
-        period: parsed.period,
-        counter: parsed.counter,
+        digits: parsed.digits.into(),
     })
 }
 
@@ -648,14 +844,12 @@ pub fn serialize_otpauth_uri(auth: FfiOtpAuth) -> Result<String, FfiError> {
     check_len("secret", &auth.secret_base32, MAX_SECRET_CHARS)?;
     let secret = OtpSecret::from_base32(&auth.secret_base32)?;
     let core_auth = uri::OtpAuth {
-        uri_type: auth.uri_type.into(),
+        kind: auth.kind.into_core(None)?,
         secret,
         issuer: auth.issuer,
         account: auth.account,
         algorithm: auth.algorithm.into(),
         digits: auth.digits.into(),
-        period: auth.period,
-        counter: auth.counter,
     };
     Ok(uri::serialize(&core_auth)?)
 }
@@ -1324,6 +1518,8 @@ fn ffi_to_core_error(source: FfiError) -> Error {
         // named by the host is checked where it is used. They degrade the same way as any
         // other error that has no core equivalent.
         FfiError::InputTooLong { .. }
+        | FfiError::InputEmpty { .. }
+        | FfiError::WrongCodeKind { .. }
         | FfiError::Qr { .. }
         | FfiError::Lan { .. }
         | FfiError::InvalidDeviceId { .. }
@@ -1933,7 +2129,7 @@ fn dik_master_key(bytes: Vec<u8>) -> Result<DikMasterKey, FfiError> {
 /// side uses as an opaque identifier (list item key, naming an entry to delete).
 /// Strings have value semantics, whereas byte-array equality and hashing in
 /// managed languages are often by reference.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiVaultEntry {
     /// Entry identifier, a 32-character lower-case hexadecimal string.
     pub id: String,
@@ -1950,16 +2146,43 @@ pub struct FfiVaultEntry {
     pub algorithm: FfiAlgorithm,
     /// Number of digits in a code.
     pub digits: FfiDigits,
-    /// Time step in seconds. Meaningless for HOTP entries.
-    pub period: u64,
-    /// The HOTP counter. `None` for TOTP entries.
-    pub counter: Option<u64>,
+    /// The kind: what decides how a code is computed, and which parameters it uses.
+    pub kind: FfiEntryKind,
+    /// Whether a PIN is stored for this entry.
+    ///
+    /// Read-only: the core never hands a PIN back, because the only thing that needs to read one
+    /// is the code computation, which happens there. A form can use this to show that a PIN
+    /// exists, and passes the new value through [`FfiEntryKind`] when the user changes it.
+    pub pin_set: bool,
     /// User note.
     pub note: String,
     /// Creation time in Unix seconds.
     pub created_at: u64,
     /// Last modification time in Unix seconds.
     pub updated_at: u64,
+}
+
+impl core::fmt::Debug for FfiVaultEntry {
+    /// Prints everything except the secret: it is the one field that must not reach a log, a
+    /// panic message or a crash dump, and the import preview makes this type travel through
+    /// diagnostics for the first time.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FfiVaultEntry")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("issuer", &self.issuer)
+            .field("account", &self.account)
+            .field("secret_base32", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("kind", &self.kind)
+            .field("pin_set", &self.pin_set)
+            .field("note", &self.note)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FfiVaultEntry {
@@ -1976,13 +2199,9 @@ impl FfiVaultEntry {
                 Algorithm::Sha256 => FfiAlgorithm::Sha256,
                 Algorithm::Sha512 => FfiAlgorithm::Sha512,
             },
-            digits: match entry.digits {
-                Digits::Six => FfiDigits::Six,
-                Digits::Seven => FfiDigits::Seven,
-                Digits::Eight => FfiDigits::Eight,
-            },
-            period: entry.period,
-            counter: entry.counter,
+            digits: entry.digits.into(),
+            kind: FfiEntryKind::from_core(&entry.kind),
+            pin_set: entry.kind.motp_pin().is_some() || entry.kind.yandex_pin().is_some(),
             note: entry.note.clone(),
             created_at: entry.created_at,
             updated_at: entry.updated_at,
@@ -1990,7 +2209,10 @@ impl FfiVaultEntry {
     }
 
     /// Builds a core entry. `now` fills in the creation and modification times.
-    fn to_core(&self, now: u64) -> Result<Entry, FfiError> {
+    ///
+    /// `existing` is the kind the stored entry has, when this is an update: a PIN the host did not
+    /// supply is carried over from it (see [`FfiEntryKind`]).
+    fn to_core(&self, now: u64, existing: Option<EntryKind>) -> Result<Entry, FfiError> {
         check_len("secret", &self.secret_base32, MAX_SECRET_CHARS)?;
         check_len("name", &self.name, MAX_VAULT_FIELD_CHARS)?;
         check_len("account", &self.account, MAX_VAULT_FIELD_CHARS)?;
@@ -2006,8 +2228,7 @@ impl FfiVaultEntry {
             secret,
             self.algorithm.into(),
             self.digits.into(),
-            self.period,
-            self.counter,
+            self.kind.clone().into_core(existing)?,
             self.note.clone(),
             now,
             now,
@@ -2257,7 +2478,7 @@ impl FfiVault {
     /// read a clock.
     pub fn add_entry(&self, entry: FfiVaultEntry, now: u64) -> Result<String, FfiError> {
         flow::check_now(now)?;
-        let core = entry.to_core(now)?;
+        let core = entry.to_core(now, None)?;
         let id = self.lock().vault_mut().insert(core)?;
         Ok(id.to_string())
     }
@@ -2281,8 +2502,17 @@ impl FfiVault {
     pub fn update_entry(&self, entry: FfiVaultEntry, now: u64) -> Result<(), FfiError> {
         flow::check_now(now)?;
         let id = entry.parse_id()?;
-        let mut core = entry.to_core(now)?;
         let mut vault = self.lock();
+        // The stored kind is handed over so a PIN the host did not supply is carried across
+        // instead of being dropped: the host was never shown it, and losing it would produce an
+        // entry that silently stops matching.
+        let existing = vault
+            .vault()
+            .get(&id)
+            .ok_or(Error::VaultEntryNotFound)?
+            .duplicate()?
+            .kind;
+        let mut core = entry.to_core(now, Some(existing))?;
         let created_at = vault
             .vault()
             .get(&id)
@@ -2323,40 +2553,70 @@ impl FfiVault {
 
     /// Computes the current code for one entry.
     ///
-    /// `unix_time` is supplied by the host side (the core does not read a
-    /// clock). Use [`FfiVault::hotp_for`] for HOTP entries.
-    pub fn totp_for(&self, id: String, unix_time: u64) -> Result<String, FfiError> {
-        self.code_for(&id, |entry| {
-            otp::totp_code(
+    /// `unix_time` is supplied by the host side (the core does not read a clock). The **kind of
+    /// the entry** decides how the code is computed: a Steam Guard entry produces five
+    /// characters, an mOTP entry six hexadecimal ones, a Yandex entry eight lower-case letters.
+    /// The host does not have to know which function to call, which is what used to make those
+    /// three arrive as ordinary TOTP entries and produce codes that never matched.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PinRequired`] (`kind` is `pin_required`) when the entry computes with a PIN and
+    /// has none, and [`Error::VaultEntryNotFound`] when the identifier is unknown. An HOTP entry
+    /// has no time-based code: use [`FfiVault::hotp_for`] with the counter the user is on.
+    pub fn code_for(&self, id: String, unix_time: u64) -> Result<String, FfiError> {
+        self.with_entry(&id, |entry| match entry.kind {
+            EntryKind::Totp { period } => Ok(otp::totp_code(
                 &entry.secret,
                 unix_time,
-                entry.period,
+                period,
                 entry.algorithm,
                 entry.digits,
-            )
+            )?),
+            EntryKind::Motp { period, ref pin } => Ok(motp::motp_code(
+                &entry.secret,
+                pin.as_ref(),
+                period,
+                unix_time,
+            )?),
+            EntryKind::Yandex { period, ref pin } => Ok(yaotp::yaotp_code(
+                &entry.secret,
+                pin.as_ref(),
+                period,
+                unix_time,
+            )?),
+            EntryKind::Steam => Ok(otp::steam_guard_code(
+                &entry.secret,
+                unix_time,
+                otp::STEAM_PERIOD,
+                entry.algorithm,
+            )?),
+            EntryKind::Hotp { .. } => Err(FfiError::WrongCodeKind {
+                kind: "hotp".to_owned(),
+                wanted: "time".to_owned(),
+            }),
         })
     }
 
     /// Computes the code for one HOTP entry at the given counter.
+    ///
+    /// The counter comes from the host side: advancing it is the user's decision (the interface
+    /// shows the next code and only then moves on), and this layer does not store a counter it
+    /// was not asked to store. Use [`FfiVault::code_for`] for every other kind.
     pub fn hotp_for(&self, id: String, counter: u64) -> Result<String, FfiError> {
-        self.code_for(&id, |entry| {
-            Ok(otp::hotp_code(
+        self.with_entry(&id, |entry| match entry.kind {
+            EntryKind::Hotp { .. } => Ok(otp::hotp_code(
                 &entry.secret,
                 counter,
                 entry.algorithm,
                 entry.digits,
-            ))
+            )),
+            _ => Err(FfiError::WrongCodeKind {
+                kind: "not_hotp".to_owned(),
+                wanted: "counter".to_owned(),
+            }),
         })
     }
-
-    /// Computes the Steam Guard code for one entry (5 characters, custom
-    /// alphabet).
-    pub fn steam_guard_for(&self, id: String, unix_time: u64) -> Result<String, FfiError> {
-        self.code_for(&id, |entry| {
-            otp::steam_guard_code(&entry.secret, unix_time, entry.period, entry.algorithm)
-        })
-    }
-
     /// Exports a recovery key file protected by a passphrase.
     ///
     /// # KDF parameters
@@ -2421,15 +2681,15 @@ impl FfiVault {
     /// core's `OtpSecret` deliberately does not implement `Clone`, so this
     /// **computes the code and returns the string** rather than copying the
     /// entry or the secret out.
-    fn code_for(
+    fn with_entry(
         &self,
         id: &str,
-        compute: impl FnOnce(&Entry) -> Result<String, Error>,
+        compute: impl FnOnce(&Entry) -> Result<String, FfiError>,
     ) -> Result<String, FfiError> {
         let id = parse_entry_id(id)?;
         let vault = self.lock();
         let entry = vault.vault().get(&id).ok_or(Error::VaultEntryNotFound)?;
-        Ok(compute(entry)?)
+        compute(entry)
     }
 }
 
@@ -3396,6 +3656,32 @@ impl FfiConflictSide {
     }
 }
 
+/// Two arrangements of the same group, for the user to choose between.
+///
+/// A group is a **sequence**, so two devices can disagree about it without disagreeing about a
+/// single entry: each added its own entries, or one reordered what both have. Neither side is
+/// wrong, which is why this is the user's choice and not a merge rule.
+///
+/// The two lists hold entry identifiers (32 hexadecimal characters) in order. An identifier the
+/// vault does not hold is one the peer knows and this device does not; the host side can look up
+/// the names of the rest in its own entry list. The identifiers are the same on both sides for
+/// every entry both devices hold, so what is being chosen is an **order**, not a set.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiOrderingConflict {
+    /// The group's name on this device.
+    pub local_name: String,
+    /// The group's name on the peer, which differs when the disagreement is a rename.
+    pub incoming_name: String,
+    /// Whether this is the group entries belong to when they belong to no named one.
+    ///
+    /// Such a group has no name, and the two name fields are empty.
+    pub top: bool,
+    /// This device's arrangement, in order.
+    pub local: Vec<String>,
+    /// The peer's arrangement, in order.
+    pub incoming: Vec<String>,
+}
+
 /// One disagreement a human has to settle.
 ///
 /// The fields are **normalized**, which is not how the core stores them: there,
@@ -3422,6 +3708,13 @@ pub struct FfiConflict {
     /// A **hint for the user interface**, not a basis for a decision: the peer fills in its
     /// own timestamps. The core never picks a side from it, and neither does the host side.
     pub local_is_newer: bool,
+    /// The two arrangements in disagreement, when the conflict is about one.
+    ///
+    /// When this is `Some`, the two sides above are `None` and `entry_id` is a **group**
+    /// identifier rather than an entry one: that is the identifier the decision names. The core
+    /// reuses one field for both because a decision about an ordering is a decision about a
+    /// whole group, and the conflict carries whichever identifier the decision needs.
+    pub ordering: Option<FfiOrderingConflict>,
 }
 
 impl FfiConflict {
@@ -3432,7 +3725,18 @@ impl FfiConflict {
     /// it would duplicate key material for a screen that only shows names), so the vault is
     /// where that version lives.
     fn from_core(conflict: &Conflict, vault: &Vault) -> Self {
+        let mut ordering = None;
         let (local, incoming, local_is_newer) = match &conflict.kind {
+            ConflictKind::OrderingMismatch { local, incoming } => {
+                ordering = Some(FfiOrderingConflict {
+                    local_name: local.name.clone(),
+                    incoming_name: incoming.name.clone(),
+                    top: local.group_order == 0 && local.name.is_empty(),
+                    local: local.entry_ids.iter().map(ToString::to_string).collect(),
+                    incoming: incoming.entry_ids.iter().map(ToString::to_string).collect(),
+                });
+                (None, None, false)
+            }
             ConflictKind::EntryMismatch { local, incoming } => (
                 Some(FfiConflictSide::from_entry(local)),
                 Some(FfiConflictSide::from_entry(incoming)),
@@ -3458,6 +3762,7 @@ impl FfiConflict {
             local,
             incoming,
             local_is_newer,
+            ordering,
         }
     }
 }
@@ -3475,12 +3780,14 @@ impl FfiConflict {
 /// | `entry_mismatch` | both sides hold a live entry with different content | either version |
 /// | `peer_deleted` | the peer reports a deletion; this device holds a newer entry | keep the entry, or accept the deletion |
 /// | `local_deleted` | this device reports a deletion; the peer still holds an entry | keep it deleted, or restore the peer's entry |
+/// | `ordering_mismatch` | both devices arranged a group, differently | this device's arrangement, or the peer's |
 #[must_use]
 pub fn conflict_kind(conflict: &Conflict) -> &'static str {
     match &conflict.kind {
         ConflictKind::EntryMismatch { .. } => "entry_mismatch",
         ConflictKind::DeletionConflict { local: None, .. } => "peer_deleted",
         ConflictKind::DeletionConflict { local: Some(_), .. } => "local_deleted",
+        ConflictKind::OrderingMismatch { .. } => "ordering_mismatch",
     }
 }
 
@@ -4188,7 +4495,7 @@ mod tests {
         assert_eq!(parsed.issuer.as_deref(), Some("ACME"));
         assert_eq!(parsed.algorithm, FfiAlgorithm::Sha256);
         assert_eq!(parsed.digits, FfiDigits::Seven);
-        assert_eq!(parsed.period, 45);
+        assert_eq!(parsed.kind, FfiEntryKind::Totp { period: 45 });
 
         let back = serialize_otpauth_uri(parsed.clone()).expect("should serialize");
         let reparsed = parse_otpauth_uri(back).expect("should parse again");
@@ -4298,14 +4605,12 @@ mod tests {
     #[test]
     fn colon_in_account_is_rejected_at_serialize() {
         let auth = FfiOtpAuth {
-            uri_type: FfiUriType::Totp,
+            kind: FfiEntryKind::Totp { period: 30 },
             secret_base32: "JBSWY3DPEHPK3PXP".to_owned(),
             issuer: None,
             account: "a:b".to_owned(),
             algorithm: FfiAlgorithm::Sha1,
             digits: FfiDigits::Six,
-            period: 30,
-            counter: None,
         };
         assert!(
             serialize_otpauth_uri(auth).is_err(),
@@ -4398,8 +4703,8 @@ mod tests {
             secret_base32: "JBSWY3DPEHPK3PXP".to_owned(),
             algorithm: FfiAlgorithm::Sha1,
             digits: FfiDigits::Six,
-            period: 30,
-            counter: None,
+            kind: FfiEntryKind::Totp { period: 30 },
+            pin_set: false,
             note: String::new(),
             created_at: 0,
             updated_at: 0,
@@ -4470,7 +4775,7 @@ mod tests {
         assert_eq!(vault.entry_count(), 1);
 
         let code = vault
-            .totp_for(id.clone(), NOW)
+            .code_for(id.clone(), NOW)
             .expect("should compute the code");
         assert_eq!(code.len(), 6, "six-digit code");
 
@@ -4479,7 +4784,7 @@ mod tests {
             FfiVault::open(store, data).expect("should open with the master key from the store");
         assert_eq!(reopened.entry_count(), 1);
         assert_eq!(
-            reopened.totp_for(id, NOW).expect("should compute the code"),
+            reopened.code_for(id, NOW).expect("should compute the code"),
             code,
             "the same entry must produce the same code after reopening"
         );
@@ -4789,6 +5094,186 @@ mod tests {
             unique.len(),
             kinds.len(),
             "two variants map to the same kind, so the client side cannot tell them apart"
+        );
+    }
+
+    /// The boundary's own errors are branched on by the host side too, so each needs a kind of
+    /// its own and none may degrade to `unknown`.
+    #[test]
+    fn every_boundary_error_kind_is_distinct_and_known() {
+        let kinds: Vec<String> = vec![
+            FfiError::InputTooLong {
+                kind: "secret".to_owned(),
+                limit: 1,
+                actual: 2,
+            }
+            .kind()
+            .to_owned(),
+            FfiError::InputEmpty {
+                kind: "pin".to_owned(),
+            }
+            .kind()
+            .to_owned(),
+            FfiError::WrongCodeKind {
+                kind: "hotp".to_owned(),
+                wanted: "time".to_owned(),
+            }
+            .kind()
+            .to_owned(),
+            FfiError::InvalidDeviceId {
+                kind: "device_id".to_owned(),
+            }
+            .kind()
+            .to_owned(),
+            FfiError::UnknownConflict {
+                entry_id: "0".repeat(32),
+            }
+            .kind()
+            .to_owned(),
+        ];
+
+        for kind in &kinds {
+            assert_ne!(kind, "unknown", "a variant is not mapped to a stable kind");
+        }
+        let unique: std::collections::HashSet<_> = kinds.iter().collect();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "two variants map to the same kind, so the client side cannot tell them apart"
+        );
+    }
+
+    /// The kind decides how a code is produced; the host does not choose the function.
+    #[test]
+    fn each_kind_produces_its_own_shape_of_code() {
+        let keys = Arc::new(TestKeys::default());
+        let store = Arc::new(TestStore::default());
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
+
+        let motp = FfiVaultEntry {
+            kind: FfiEntryKind::Motp {
+                period: 10,
+                pin: Some("1234".to_owned()),
+            },
+            ..sample_entry("mOTP")
+        };
+        let motp_id = vault.add_entry(motp, NOW).expect("should add the entry");
+        let code = vault
+            .code_for(motp_id.clone(), NOW)
+            .expect("should compute the mOTP code");
+        assert_eq!(code.len(), 6, "mOTP codes are six characters");
+        assert!(
+            code.chars().all(|character| character.is_ascii_hexdigit()),
+            "mOTP codes are hexadecimal, actual {code}"
+        );
+
+        let steam = FfiVaultEntry {
+            kind: FfiEntryKind::Steam,
+            digits: FfiDigits::Five,
+            ..sample_entry("Steam")
+        };
+        let steam_id = vault.add_entry(steam, NOW).expect("should add the entry");
+        let code = vault
+            .code_for(steam_id, NOW)
+            .expect("should compute the Steam code");
+        assert_eq!(code.len(), 5, "Steam Guard codes are five characters");
+
+        // Yandex OTP verifies its secret length, so this one needs a sixteen-byte secret.
+        let yandex = FfiVaultEntry {
+            kind: FfiEntryKind::Yandex {
+                period: 30,
+                pin: Some("1234".to_owned()),
+            },
+            digits: FfiDigits::Eight,
+            secret_base32: "LA2V6KMCGYMWWVEW64RNP3JA3I".to_owned(),
+            ..sample_entry("Yandex")
+        };
+        let yandex_id = vault.add_entry(yandex, NOW).expect("should add the entry");
+        let code = vault
+            .code_for(yandex_id, NOW)
+            .expect("should compute the Yandex code");
+        assert_eq!(code.len(), 8, "Yandex OTP codes are eight letters");
+        assert!(
+            code.chars().all(|character| character.is_ascii_lowercase()),
+            "Yandex OTP codes are lower-case letters, actual {code}"
+        );
+
+        // The PIN is stored but never handed back.
+        let stored = vault.entry(motp_id).expect("the entry exists");
+        assert!(stored.pin_set, "the PIN is reported as set");
+        assert_eq!(
+            stored.kind,
+            FfiEntryKind::Motp {
+                period: 10,
+                pin: None
+            },
+            "and its value does not cross the boundary"
+        );
+    }
+
+    /// Calling the wrong function for an entry's kind is an error, not a wrong code.
+    #[test]
+    fn a_code_the_kind_cannot_produce_is_refused() {
+        let keys = Arc::new(TestKeys::default());
+        let store = Arc::new(TestStore::default());
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
+
+        let totp_id = vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("should add the entry");
+        let error = vault
+            .hotp_for(totp_id, 1)
+            .expect_err("a time-based entry has no counter to advance");
+        assert_eq!(error.kind(), "wrong_code_kind");
+
+        let hotp = FfiVaultEntry {
+            kind: FfiEntryKind::Hotp { counter: 0 },
+            ..sample_entry("Bank")
+        };
+        let hotp_id = vault.add_entry(hotp, NOW).expect("should add the entry");
+        let error = vault
+            .code_for(hotp_id, NOW)
+            .expect_err("an event-based entry has no clock to read");
+        assert_eq!(error.kind(), "wrong_code_kind");
+    }
+
+    /// Key material does not reach a `Debug` printout, which is where a panic message, a log
+    /// line and a crash dump all come from.
+    #[test]
+    fn key_material_never_reaches_a_debug_printout() {
+        let entry = sample_entry("GitHub");
+        let printed = format!("{entry:?}");
+        assert!(
+            !printed.contains("JBSWY3DPEHPK3PXP"),
+            "the secret must not appear: {printed}"
+        );
+        assert!(printed.contains("<redacted>"), "actual {printed}");
+
+        let auth = FfiOtpAuth {
+            kind: FfiEntryKind::Motp {
+                period: 10,
+                pin: Some("5210481216086702".to_owned()),
+            },
+            secret_base32: "JBSWY3DPEHPK3PXP".to_owned(),
+            issuer: None,
+            account: "alice".to_owned(),
+            algorithm: FfiAlgorithm::Sha1,
+            digits: FfiDigits::Six,
+        };
+        let printed = format!("{auth:?}");
+        assert!(
+            !printed.contains("JBSWY3DPEHPK3PXP"),
+            "the secret must not appear: {printed}"
+        );
+        assert!(
+            !printed.contains("5210481216086702"),
+            "the PIN must not appear: {printed}"
+        );
+        assert!(
+            format!("{:?}", auth.kind).contains("<set>"),
+            "the fact that a PIN is set is what an operator needs"
         );
     }
 
