@@ -117,12 +117,30 @@ the file" — the master key never appears in Kotlin/Swift as bytes even once.
 | `updateEntry(entry, now)` | Modifies one (**the identity is kept and no tombstone is left**) |
 | `removeEntry(id, now)` → `Bool` | Removes one (leaves a tombstone) |
 | `serialize` | Serializes, for the host side to write **atomically** |
-| `totpFor` / `hotpFor` / `steamGuardFor` | Computes a code straight from an entry |
+| `codeFor(id, now)` / `hotpFor(id, counter)` | Computes a code from the **entry's kind** |
+| `groups` / `groupOf(id)` | The groups and their orderings (the top group is always first) |
+| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | Adds, renames, moves and removes groups (removing one keeps its entries) |
+| `setOrdering` / `assignToGroup` | Writes an ordering (the whole list) and moves an entry into a group |
 | `exportRecoveryKey(passphrase, …)` | Exports a recovery key file |
 
 `updateEntry` and `removeEntry` differ by more than semantics: an update keeps the entry's
 identity, a removal leaves a tombstone. The two are read as completely different operations
 on another device, so **do not** implement an update as "remove + add".
+
+### Importing (`FfiImport`)
+
+Reads another authenticator's export: `FfiImport.preview(bytes, format, password, now)` takes JSON,
+HTML or one URI per line (an encrypted JSON needs a password), and `detectFormat(bytes)` can guess
+the format from the content first. On the returned object, `entries` / `problems` / `groups` /
+`dropped` are what the preview shows, `compare(vault)` says which entries the vault already holds
+and which share a secret but differ (a question for the user), and `apply(vault, choices)` carries
+the answers out.
+
+**No secret and no PIN cross the boundary**: `FfiImportedEntry` holds the name, the service, the
+account, the algorithm, the digit count and the kind, and the kind arrives without its PIN. The
+parsed export stays in Rust, which reads it back when the import is applied. **An entry with no
+answer is added, never overwritten** - losing a note the user wrote is worse than leaving a
+duplicate they can delete.
 
 ### Registration and login
 
@@ -352,7 +370,19 @@ Three things a caller has to know:
 > them"; the connection handshake proves the identity, and the core decides from the device
 > identifier whether a payload may be accepted.
 
-## Error handling
+### Breaking changes in 0.2.0
+
+- **Entry shape**: `FfiVaultEntry` / `FfiOtpAuth` no longer carry `period` / `counter` /
+  `uri_type`; they carry `kind` (`FfiEntryKind`: TOTP, HOTP, mOTP, Yandex OTP, Steam). `FfiDigits`
+  gains `Five`, `Nine` and `OtherDigits` (a count a form does not offer is carried through).
+- **One code entry point**: `totpFor` / `steamGuardFor` are replaced by `codeFor`, which lets the
+  entry's own kind decide the computation, while `hotpFor` stays. Calling the wrong one for an
+  entry is `wrong_code_kind` rather than a code that never matches.
+- **The PIN is write-only**: it is passed in through `FfiEntryKind`'s `pin` and reported back only
+  as `pinSet`. On update, `pin: None` means "keep the stored PIN", so editing a note does not ask
+  the user to retype it.
+- **Depends on `qualia2fa-core 0.2.0`**: vault format **3**, sync payload **3**, and no
+  synchronization with 0.1.x at all - both devices have to be upgraded together.
 
 Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
 

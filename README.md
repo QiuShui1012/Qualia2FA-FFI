@@ -13,8 +13,9 @@ English version: [README.en.md](README.en.md).
 | 许可证 | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-已导出 OTP、保险库、恢复密钥、注册/登录、挑战-应答与同步。除此之外，本层还**自己实现**
-了局域网通道（组播发现 + 端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
+已导出 OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）、保险库、分组与排序、导入、
+恢复密钥、注册/登录、挑战-应答与同步。除此之外，本层还**自己实现**了局域网通道（组播发现 +
+端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
 
 ## 用法
 
@@ -106,11 +107,25 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 | `updateEntry(entry, now)` | 修改（**标识不变、不留墓碑**） |
 | `removeEntry(id, now)` → `Bool` | 删除（留墓碑） |
 | `serialize` | 序列化，供端侧**原子地**落盘 |
-| `totpFor` / `hotpFor` / `steamGuardFor` | 直接按条目算验证码 |
+| `codeFor(id, now)` / `hotpFor(id, counter)` | 按**条目的种类**算验证码 |
+| `groups` / `groupOf(id)` | 分组与它们的排序（顶分组永远在第一个） |
+| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | 分组的增删改名与排序（删组不删条目） |
+| `setOrdering` / `assignToGroup` | 写排序（整份列表）与把条目移进某个分组 |
 | `exportRecoveryKey(passphrase, …)` | 导出恢复密钥文件 |
 
 `updateEntry` 与 `removeEntry` 的区别不只是语义：修改保留条目标识，删除留下墓碑。
 两者在另一台设备上被读成完全不同的操作，因此**不要**用「删除 + 新增」实现修改。
+
+### 导入（`FfiImport`）
+
+从别的认证器导入一份导出：`FfiImport.preview(bytes, format, password, now)` 读它（JSON、HTML，
+或每行一个 URI；加密的 JSON 需要口令），`detectFormat(bytes)` 也可以先从内容猜格式。返回的对象上，
+`entries` / `problems` / `groups` / `dropped` 是预览要显示的东西，`compare(vault)` 说出「哪些已经有
+了、哪些共享同一把密钥但字段不同（要人来定）」，`apply(vault, choices)` 落实答案。
+
+**密钥与 PIN 都不跨界**：`FfiImportedEntry` 只有名字、服务、账号、算法、位数与种类，而种类里的 PIN
+是空的；解析后的导出留在 Rust 侧，应用时由它自己读回来。**没给答案的条目一律是「加入」**，绝不覆盖
+——丢掉用户写过的备注，比留下一条他能删掉的重复更糟。
 
 ### 注册与登录
 
@@ -318,7 +333,17 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
 > 登记进来。公告本身**不认证**——它只回答「这个网段上大概有谁、去哪里找他」，真的身份
 > 由连接握手证明，载荷该不该收由核心按设备标识判断。
 
-## 错误处理
+### 0.2.0 的破坏性变更
+
+- **条目形状**：`FfiVaultEntry` / `FfiOtpAuth` 不再有 `period` / `counter` / `uri_type`，改为
+  `kind`（`FfiEntryKind`：TOTP / HOTP / mOTP / Yandex OTP / Steam）。`FfiDigits` 补上 `Five` /
+  `Nine` 与 `OtherDigits`（表单不提供的档位照实带过）。
+- **算码入口**：`totpFor` / `steamGuardFor` 合并成 `codeFor`（由条目自己的种类决定算法），
+  `hotpFor` 保留。对条目调错函数会得到 `wrong_code_kind`，而不是一个永远对不上的码。
+- **PIN 只进不出**：写入时经 `FfiEntryKind` 的 `pin` 传入，读取时只报 `pinSet`。更新时
+  `pin: None` 表示**保留原有 PIN**，所以编辑备注不需要用户重输。
+- **依赖 `qualia2fa-core 0.2.0`**：保险库格式 **3**、同步载荷 **3**，与 0.1.x **无法同步**，
+  两端必须一起升级。
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 

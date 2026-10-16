@@ -84,7 +84,7 @@ use qualia2fa_core::transport::{
     Recipient, Roster, SharePlan, SyncSession, Transport, TransportCapabilities,
 };
 use qualia2fa_core::uri;
-use qualia2fa_core::vault::{Entry, EntryKind, MasterKey, Vault, VaultFile};
+use qualia2fa_core::vault::{Entry, EntryKind, Group, MasterKey, Vault, VaultFile};
 use qualia2fa_core::yaotp::{self, YandexPin};
 use qualia2fa_core::{Error, ExposeSecret as _, SecretString};
 
@@ -2164,6 +2164,45 @@ pub struct FfiVaultEntry {
     pub updated_at: u64,
 }
 
+/// A group, with the order of the entries in it.
+///
+/// A group is a **sequence**, not a set: the ordering is what the user arranged, and it is
+/// synchronized between devices (see [`FfiConflict`] for what happens when two devices arrange
+/// the same group differently).
+///
+/// The **top group** is the one entries belong to when they belong to no named group. It always
+/// exists, it is always first in the group order, it has no name, and its identifier is all
+/// zeroes; [`FfiGroup::top`] says so rather than leaving the host to recognize that identifier.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGroup {
+    /// The group's identifier, 32 hexadecimal characters.
+    pub id: String,
+    /// The name, empty for the top group.
+    pub name: String,
+    /// Position in the group order, starting at zero.
+    ///
+    /// Assigning a position moves the group there and shifts the others, so the numbers stay a
+    /// dense sequence: they are an order, not a value a host may leave gaps in.
+    pub order: u64,
+    /// Whether this is the top group.
+    pub top: bool,
+    /// The entries in this group, in order, as 32 hexadecimal characters each.
+    pub entry_ids: Vec<String>,
+}
+
+impl FfiGroup {
+    /// Reads one group as the host side sees it.
+    fn from_core(id: &qualia2fa_core::vault::GroupId, group: &Group) -> Self {
+        Self {
+            id: hex_id(id.as_bytes()),
+            name: group.name.clone(),
+            order: group.group_order as u64,
+            top: id.is_top(),
+            entry_ids: group.entry_ids.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
 impl core::fmt::Debug for FfiVaultEntry {
     /// Prints everything except the secret: it is the one field that must not reach a log, a
     /// panic message or a crash dump, and the import preview makes this type travel through
@@ -2264,6 +2303,31 @@ fn parse_entry_id(text: &str) -> Result<qualia2fa_core::vault::EntryId, FfiError
         *slot = (hi << 4) | lo;
     }
     Ok(qualia2fa_core::vault::EntryId::from_bytes(id))
+}
+
+/// Parses the hexadecimal representation of a `GroupId` (32 lower-case hexadecimal characters).
+///
+/// The same shape as an entry identifier, and parsed the same way: a group identifier is opaque to
+/// the host side, which only ever passes back what this layer gave it.
+fn parse_group_id(text: &str) -> Result<qualia2fa_core::vault::GroupId, FfiError> {
+    check_len("group_id", text, 32)?;
+    let bytes = text.as_bytes();
+    if bytes.len() != 32 {
+        return Err(FfiError::Core {
+            detail: Error::UriInvalidParameter {
+                name: "group_id".to_owned(),
+                reason: "must be 32 hexadecimal characters".to_owned(),
+            }
+            .into(),
+        });
+    }
+    let mut id = [0_u8; 16];
+    for (index, slot) in id.iter_mut().enumerate() {
+        let hi = hex_digit(bytes[index * 2])?;
+        let lo = hex_digit(bytes[index * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(qualia2fa_core::vault::GroupId::from_bytes(id))
 }
 
 /// One hexadecimal character → its value.
@@ -2540,6 +2604,149 @@ impl FfiVault {
         flow::check_now(now)?;
         let id = parse_entry_id(&id)?;
         Ok(self.lock().vault_mut().remove(&id, now).is_some())
+    }
+
+    /// The groups, in the group order, with the ordering of each.
+    ///
+    /// The top group is always there and always **first**, so a host that shows "all entries" has
+    /// one place to look: its `entry_ids` are the entries that belong to no named group. The named
+    /// groups follow in `order`, which is the order [`FfiVault::move_group`] positions refer to.
+    ///
+    /// # Why the sort is not by `order` alone
+    ///
+    /// The top group's order is zero, and the first named group's order is zero as well: the core
+    /// numbers named groups from zero and keeps the top group out of that sequence. Sorting every
+    /// group by its order alone would therefore leave the top group's place to a tie-break, so the
+    /// sort here states the rule instead - the top group first, then named groups by order and
+    /// identifier, which is what the core's own ordering means.
+    #[must_use]
+    pub fn groups(&self) -> Vec<FfiGroup> {
+        let vault = self.lock();
+        let mut groups: Vec<FfiGroup> = vault
+            .vault()
+            .groups()
+            .map(|(id, group)| FfiGroup::from_core(id, group))
+            .collect();
+        groups.sort_by_key(|group| (!group.top, group.order, group.id.clone()));
+        groups
+    }
+
+    /// The group an entry belongs to, as 32 hexadecimal characters.
+    ///
+    /// Always `Some` for an entry the vault holds: an entry that belongs to no named group belongs
+    /// to the top group, which is a group like any other here.
+    #[must_use]
+    pub fn group_of(&self, entry_id: String) -> Option<String> {
+        let id = parse_entry_id(&entry_id).ok()?;
+        let vault = self.lock();
+        vault
+            .vault()
+            .group_of(&id)
+            .map(|group| hex_id(group.as_bytes()))
+    }
+
+    /// Creates a named group at the end of the group order and returns its identifier.
+    ///
+    /// # Errors
+    ///
+    /// The core's error for a name longer than a vault field allows (`field_too_long`).
+    pub fn create_group(&self, name: String) -> Result<String, FfiError> {
+        check_len("group_name", &name, MAX_VAULT_FIELD_CHARS)?;
+        if name.is_empty() {
+            return Err(FfiError::InputEmpty {
+                kind: "group_name".to_owned(),
+            });
+        }
+        let id = self.lock().vault_mut().create_group(name)?;
+        Ok(hex_id(id.as_bytes()))
+    }
+
+    /// Renames a group.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultTopGroupImmutable`] (`kind` is `vault_top_group_immutable`) for the top group,
+    /// which has no name to edit, and [`Error::VaultGroupNotFound`] for an unknown identifier.
+    pub fn rename_group(&self, group_id: String, name: String) -> Result<(), FfiError> {
+        check_len("group_name", &name, MAX_VAULT_FIELD_CHARS)?;
+        let id = parse_group_id(&group_id)?;
+        self.lock().vault_mut().rename_group(&id, name)?;
+        Ok(())
+    }
+
+    /// Moves a group to a position among the **named** groups.
+    ///
+    /// The position is where the group ends up, not how far it moves: the caller says "make this
+    /// the second group" rather than "move it up by one", so a caller that has just reloaded the
+    /// list cannot shift a group by the wrong amount. The top group is not part of that sequence -
+    /// it stays first - so position `0` means the first named group, and a position past the end
+    /// puts the group last.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultGroupNotFound`] for an unknown identifier, and
+    /// [`Error::VaultTopGroupImmutable`] for the top group, whose place is fixed.
+    pub fn move_group(&self, group_id: String, position: u64) -> Result<(), FfiError> {
+        let id = parse_group_id(&group_id)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a group order is a small number of groups, and the core rejects a position past the end"
+        )]
+        let position = position as usize;
+        self.lock().vault_mut().reorder_group(&id, position)?;
+        Ok(())
+    }
+
+    /// Removes a group.
+    ///
+    /// The entries in it are **not** deleted: they return to the top group, which is what "belongs
+    /// to no named group" means.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultTopGroupImmutable`] for the top group, and [`Error::VaultGroupNotFound`] for
+    /// an unknown identifier.
+    pub fn remove_group(&self, group_id: String) -> Result<(), FfiError> {
+        let id = parse_group_id(&group_id)?;
+        self.lock().vault_mut().remove_group(&id)?;
+        Ok(())
+    }
+
+    /// Replaces the ordering of a group.
+    ///
+    /// The list is the whole ordering, not a change to it: a host that reorders one row sends the
+    /// result, which is both simpler and safer than describing a move. Entries the new ordering
+    /// drops return to the top group unless another group claims them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultGroupNotFound`] for an unknown group,
+    /// [`Error::VaultGroupUnknownEntry`] for an identifier the vault does not hold, and
+    /// [`Error::VaultGroupDuplicateEntry`] when the list names one entry twice.
+    pub fn set_ordering(&self, group_id: String, entry_ids: Vec<String>) -> Result<(), FfiError> {
+        let id = parse_group_id(&group_id)?;
+        let mut parsed = Vec::with_capacity(entry_ids.len());
+        for entry_id in &entry_ids {
+            parsed.push(parse_entry_id(entry_id)?);
+        }
+        self.lock().vault_mut().set_ordering(&id, parsed)?;
+        Ok(())
+    }
+
+    /// Moves an entry into a group, appending it to that group's ordering.
+    ///
+    /// This is the "move to group" operation: the entry leaves wherever it was, so the host does
+    /// not have to know where it came from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultEntryNotFound`] for an unknown entry and [`Error::VaultGroupNotFound`] for an
+    /// unknown group.
+    pub fn assign_to_group(&self, entry_id: String, group_id: String) -> Result<(), FfiError> {
+        let entry = parse_entry_id(&entry_id)?;
+        let group = parse_group_id(&group_id)?;
+        self.lock().vault_mut().assign_to_group(&entry, &group)?;
+        Ok(())
     }
 
     /// Serializes into vault file bytes for the host side to persist.
@@ -5715,6 +5922,93 @@ mod tests {
         assert!(
             FfiImport::preview(encrypted.to_vec(), FfiImportFormat::Json, None, NOW).is_err(),
             "an encrypted export needs a password"
+        );
+    }
+
+    /// Groups and orderings cross the boundary as sequences.
+    #[test]
+    fn groups_and_orderings_cross_the_boundary() {
+        let keys = Arc::new(TestKeys::default());
+        let store = Arc::new(TestStore::default());
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
+        let top = "0".repeat(32);
+
+        let first = vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("should add the entry");
+        let second = vault
+            .add_entry(sample_entry("Bank"), NOW)
+            .expect("should add the entry");
+
+        // Everything starts in the top group, in the order it was added.
+        let groups = vault.groups();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].top);
+        assert_eq!(groups[0].id, top);
+        assert!(groups[0].name.is_empty());
+        assert_eq!(groups[0].entry_ids, vec![first.clone(), second.clone()]);
+        assert_eq!(vault.group_of(first.clone()), Some(top.clone()));
+
+        // A new group goes to the end of the order and receives an entry.
+        let work = vault
+            .create_group("Work".to_owned())
+            .expect("creates the group");
+        vault
+            .assign_to_group(first.clone(), work.clone())
+            .expect("moves the entry");
+        let groups = vault.groups();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].top, "the top group stays first");
+        assert_eq!(groups[1].name, "Work");
+        assert_eq!(groups[1].entry_ids, vec![first.clone()]);
+        assert_eq!(
+            groups[0].entry_ids,
+            vec![second.clone()],
+            "the entry left the top group"
+        );
+        assert_eq!(vault.group_of(first.clone()), Some(work.clone()));
+
+        // Renaming and moving are visible in the next read.
+        let later = vault.create_group("Later".to_owned()).expect("creates");
+        vault
+            .rename_group(work.clone(), "Work stuff".to_owned())
+            .expect("renames");
+        vault
+            .move_group(later.clone(), 0)
+            .expect("moves to the front of the named groups");
+        let groups = vault.groups();
+        assert_eq!(groups[1].id, later, "the move put it first among the named");
+        assert_eq!(groups[2].name, "Work stuff");
+        assert!(groups[0].top);
+
+        // The top group cannot be renamed or moved.
+        assert!(vault.rename_group(top.clone(), "Nope".to_owned()).is_err());
+        assert!(vault.move_group(top.clone(), 1).is_err());
+
+        // The ordering is the whole list: an entry the new list drops returns to the top group.
+        vault
+            .set_ordering(later.clone(), vec![first.clone()])
+            .expect("sets the ordering");
+        assert_eq!(
+            vault.groups()[1].entry_ids,
+            vec![first.clone()],
+            "the entry is where the ordering put it"
+        );
+        assert!(
+            vault.groups()[0].entry_ids.contains(&second),
+            "and nothing was lost"
+        );
+
+        // Removing a group returns its entries to the top group; no entry is deleted with it.
+        vault.remove_group(later).expect("removes the group");
+        let groups = vault.groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(vault.entry_count(), 2);
+        assert_eq!(
+            groups[0].entry_ids.len(),
+            2,
+            "both entries are back in the top group"
         );
     }
 
