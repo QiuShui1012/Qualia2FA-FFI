@@ -56,6 +56,7 @@
 
 uniffi::setup_scaffolding!();
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -72,6 +73,7 @@ use qualia_transport::lan::wire::{ENDPOINT_KEY_LEN, EndpointKey, Peer, PeerStatu
 use qualia_transport::lan::{LanAddress, lobby::Lobby};
 use qualia2fa_core::auth;
 use qualia2fa_core::flow::{self, DeviceKeys as _, Joiner, Login, SecureStore as _};
+use qualia2fa_core::import::apply::{Choice as ImportChoice, Difference as ImportDifference};
 use qualia2fa_core::motp::{self, MotpPin};
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::recovery::KdfParams;
@@ -3603,6 +3605,390 @@ impl From<SharePlan> for FfiSharePlan {
     }
 }
 
+// ── Importing another authenticator's export ─────────────────────────
+
+/// An export format the host side can name.
+///
+/// [`FfiImport::detect_format`] answers the same question from the content, which is what a file
+/// the user picked needs: the extension is a hint, not evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiImportFormat {
+    /// The JSON export, plaintext or encrypted.
+    Json,
+    /// The HTML export: one table row per entry.
+    Html,
+    /// The text export: one URI per line.
+    Text,
+}
+
+impl From<FfiImportFormat> for qualia2fa_core::import::ImportFormat {
+    fn from(value: FfiImportFormat) -> Self {
+        match value {
+            FfiImportFormat::Json => Self::Json,
+            FfiImportFormat::Html => Self::Html,
+            FfiImportFormat::Text => Self::Text,
+        }
+    }
+}
+
+/// Names one field in which an imported entry differs from the one the vault holds.
+///
+/// # Stability contract
+///
+/// New values may be added; an existing one must not be renamed or change meaning, and a client
+/// needs a fallback branch. Values: `name`, `issuer`, `account`, `note`, `algorithm`, `digits`,
+/// `kind` (the kind carries the step, the counter and any PIN).
+#[must_use]
+fn import_difference_name(difference: ImportDifference) -> &'static str {
+    match difference {
+        ImportDifference::Name => "name",
+        ImportDifference::Issuer => "issuer",
+        ImportDifference::Account => "account",
+        ImportDifference::Note => "note",
+        ImportDifference::Algorithm => "algorithm",
+        ImportDifference::Digits => "digits",
+        ImportDifference::Kind => "kind",
+    }
+}
+
+/// Formats a sixteen-byte identifier the way the host side names entries and groups.
+#[must_use]
+fn hex_id(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// One entry an export holds, as the preview shows it.
+///
+/// **No secret and no PIN cross here.** The preview answers "what is in this file?", and a name, a
+/// service, an account and the shape of the code answer it; the key material stays in Rust, where
+/// applying the import reads it again.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportedEntry {
+    /// Where the entry was in the export, counting from 1.
+    ///
+    /// This is the handle a decision names: positions are unique within one export, and the entry
+    /// has no identifier yet.
+    pub position: u64,
+    /// Display name.
+    pub name: String,
+    /// Issuer (service name), if any.
+    pub issuer: Option<String>,
+    /// Account name.
+    pub account: String,
+    /// Hash algorithm the code uses.
+    pub algorithm: FfiAlgorithm,
+    /// Number of digits in the code.
+    pub digits: FfiDigits,
+    /// The kind, without the PIN (see [`FfiEntryKind`]).
+    pub kind: FfiEntryKind,
+    /// Whether the export marked it a favourite.
+    ///
+    /// Not a field of the entry: an import turns it into **order**, placing favourites before the
+    /// rest within their group.
+    pub favorite: bool,
+    /// Whether the export carried an icon, which this version drops.
+    pub icon_dropped: bool,
+    /// Whether the time step had to be assumed, because the format does not carry one.
+    pub period_assumed: bool,
+}
+
+/// One entry of an export that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportProblem {
+    /// Where in the export it was, counting from 1.
+    pub position: u64,
+    /// Why it was skipped, in a phrase meant for the user.
+    ///
+    /// Never carries a value from the file: a problem list ends up in logs and screenshots.
+    pub reason: String,
+}
+
+/// A group the export defined.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportedGroup {
+    /// The group's identifier, 32 hexadecimal characters, the same on every device that imports
+    /// this file.
+    pub id: String,
+    /// The name the export gave it.
+    pub name: String,
+}
+
+/// What was dropped or assumed across a whole export.
+///
+/// Counts rather than a list: the interface says this once, in one sentence, instead of
+/// interrupting per entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiDroppedSummary {
+    /// Entries whose icon was dropped.
+    pub icons: u64,
+    /// Entries whose time step was assumed.
+    pub periods_assumed: u64,
+    /// Entries skipped because the same export listed them twice.
+    pub duplicates: u64,
+}
+
+/// What the vault already holds that relates to one imported entry.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportMatch {
+    /// Where the entry was in the export, counting from 1.
+    pub position: u64,
+    /// Whether the vault already holds this entry, in every field the user can see.
+    pub identical: bool,
+    /// Entries in the vault that use the same secret, as 32 hexadecimal characters each.
+    pub existing: Vec<String>,
+    /// The fields that differ from the closest match, as stable names.
+    ///
+    /// # Stability contract
+    ///
+    /// New values may be added; an existing one must not be renamed or change meaning, and a
+    /// client needs a fallback branch. Values: `name`, `issuer`, `account`, `note`, `algorithm`,
+    /// `digits`, `kind` (the kind carries the step, the counter and any PIN).
+    pub differences: Vec<String>,
+}
+
+/// What to do with one imported entry.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiImportDecision {
+    /// Add it, leaving whatever the vault holds alone.
+    Add,
+    /// Change nothing: the vault already holds it.
+    Skip,
+    /// Put the imported version in place of the entry with this identifier.
+    ///
+    /// The identifier stays, so the entry keeps its group and its place in the ordering.
+    Replace {
+        /// The entry to replace, as 32 hexadecimal characters.
+        entry_id: String,
+    },
+    /// Add it and keep the existing entry as well.
+    KeepBoth,
+}
+
+/// One answer, keyed by the position the entry had in the export.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportChoice {
+    /// The position of the entry this answer is about.
+    pub position: u64,
+    /// What to do with it.
+    pub decision: FfiImportDecision,
+}
+
+/// What an applied import did.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImportApplied {
+    /// Entries added.
+    pub added: u64,
+    /// Entries whose content was replaced.
+    pub replaced: u64,
+    /// Entries left alone because the vault already held them.
+    pub skipped: u64,
+    /// Groups created from the export, as 32 hexadecimal characters each.
+    pub groups_created: Vec<String>,
+    /// Groups the export named that the vault already had.
+    pub groups_existing: Vec<String>,
+}
+
+/// One export, read and waiting for a decision.
+///
+/// The parsed export lives here, in Rust, **with its secrets**: the preview the host side sees
+/// holds none of them, and applying the import reads them from this object rather than from a
+/// second copy the host would have to keep.
+#[derive(uniffi::Object)]
+pub struct FfiImport {
+    /// The parsed export.
+    report: qualia2fa_core::import::ImportReport,
+}
+
+#[uniffi::export]
+impl FfiImport {
+    /// Reads an export without touching a vault.
+    ///
+    /// `password` is only looked at when the export is encrypted; `now` is the current Unix second
+    /// supplied by the host side (this library reads no clock) and becomes the creation and
+    /// modification time of every imported entry.
+    ///
+    /// # Errors
+    ///
+    /// A file-level failure: not the format it claims to be, larger than this layer reads, a
+    /// version it does not read, or a password it needs or does not accept. An entry that cannot
+    /// be read is **not** such a failure: it appears in [`FfiImport::problems`] and the rest of
+    /// the file is imported.
+    #[uniffi::constructor]
+    pub fn preview(
+        bytes: Vec<u8>,
+        format: FfiImportFormat,
+        password: Option<String>,
+        now: u64,
+    ) -> Result<Arc<Self>, FfiError> {
+        flow::check_now(now)?;
+        let report = qualia2fa_core::import::import(
+            &bytes,
+            format.into(),
+            now,
+            password.as_ref().map(String::as_bytes),
+        )?;
+        Ok(Arc::new(Self { report }))
+    }
+
+    /// Guesses the format from the content of a file.
+    ///
+    /// Returns `None` when it is not recognisable; the host side should then ask the user, which
+    /// costs one question and avoids reading a file as the wrong format.
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn detect_format(bytes: Vec<u8>) -> Option<FfiImportFormat> {
+        match qualia2fa_core::import::ImportFormat::detect(&bytes)? {
+            qualia2fa_core::import::ImportFormat::Json => Some(FfiImportFormat::Json),
+            qualia2fa_core::import::ImportFormat::Html => Some(FfiImportFormat::Html),
+            qualia2fa_core::import::ImportFormat::Text => Some(FfiImportFormat::Text),
+        }
+    }
+
+    /// The entries that could be read, in the order the export listed them.
+    #[must_use]
+    pub fn entries(&self) -> Vec<FfiImportedEntry> {
+        self.report
+            .entries
+            .iter()
+            .map(|imported| FfiImportedEntry {
+                position: imported.position as u64,
+                name: imported.entry.name.clone(),
+                issuer: imported.entry.issuer.clone(),
+                account: imported.entry.account.clone(),
+                algorithm: match imported.entry.algorithm {
+                    Algorithm::Sha1 => FfiAlgorithm::Sha1,
+                    Algorithm::Sha256 => FfiAlgorithm::Sha256,
+                    Algorithm::Sha512 => FfiAlgorithm::Sha512,
+                },
+                digits: imported.entry.digits.into(),
+                kind: FfiEntryKind::from_core(&imported.entry.kind),
+                favorite: imported.favorite,
+                icon_dropped: imported
+                    .notes
+                    .contains(&qualia2fa_core::import::ImportNote::IconDropped),
+                period_assumed: imported.notes.iter().any(|note| {
+                    matches!(
+                        note,
+                        qualia2fa_core::import::ImportNote::PeriodAssumed { .. }
+                    )
+                }),
+            })
+            .collect()
+    }
+
+    /// The entries that could not be read, each with its position and a reason.
+    #[must_use]
+    pub fn problems(&self) -> Vec<FfiImportProblem> {
+        self.report
+            .problems
+            .iter()
+            .map(|problem| FfiImportProblem {
+                position: problem.position as u64,
+                reason: problem.reason.clone(),
+            })
+            .collect()
+    }
+
+    /// The groups the export defined.
+    #[must_use]
+    pub fn groups(&self) -> Vec<FfiImportedGroup> {
+        self.report
+            .groups
+            .iter()
+            .map(|group| FfiImportedGroup {
+                id: hex_id(group.id.as_bytes()),
+                name: group.name.clone(),
+            })
+            .collect()
+    }
+
+    /// What was dropped or assumed across the whole export.
+    #[must_use]
+    pub fn dropped(&self) -> FfiDroppedSummary {
+        FfiDroppedSummary {
+            icons: self.report.dropped.icons as u64,
+            periods_assumed: self.report.dropped.periods_assumed as u64,
+            duplicates: self.report.dropped.duplicates as u64,
+        }
+    }
+
+    /// Compares every entry against a vault.
+    ///
+    /// The result is in the order of [`FfiImport::entries`]. An entry that is `identical` should
+    /// be skipped without asking; one that is not, but has entries in `existing`, is the question
+    /// the user answers with [`FfiImportChoice`].
+    #[must_use]
+    pub fn compare(&self, vault: Arc<FfiVault>) -> Vec<FfiImportMatch> {
+        let vault = vault.lock();
+        qualia2fa_core::import::apply::compare(&self.report, vault.vault())
+            .into_iter()
+            .map(|found| FfiImportMatch {
+                position: found.position as u64,
+                identical: found.identical,
+                existing: found.existing.iter().map(ToString::to_string).collect(),
+                differences: found
+                    .differences
+                    .into_iter()
+                    .map(|difference| import_difference_name(difference).to_owned())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Applies the import to a vault.
+    ///
+    /// `choices` holds the answers for the entries the user was asked about; an entry with no
+    /// answer is added, unless the vault already holds it exactly, in which case it is skipped.
+    /// **Nothing is ever overwritten without an answer.**
+    ///
+    /// # Errors
+    ///
+    /// The core's error when an answer names an entry the vault no longer holds
+    /// (`vault_entry_not_found`), and its errors for a name that is too long or an identifier that
+    /// is taken.
+    pub fn apply(
+        &self,
+        vault: Arc<FfiVault>,
+        choices: Vec<FfiImportChoice>,
+    ) -> Result<FfiImportApplied, FfiError> {
+        let mut answers: HashMap<usize, ImportChoice> = HashMap::new();
+        for choice in choices {
+            let decision = match choice.decision {
+                FfiImportDecision::Add => ImportChoice::Add,
+                FfiImportDecision::Skip => ImportChoice::Skip,
+                FfiImportDecision::KeepBoth => ImportChoice::KeepBoth,
+                FfiImportDecision::Replace { entry_id } => {
+                    ImportChoice::Replace(parse_entry_id(&entry_id)?)
+                }
+            };
+            answers.insert(choice.position as usize, decision);
+        }
+
+        let mut vault = vault.lock();
+        let applied =
+            qualia2fa_core::import::apply::apply(vault.vault_mut(), &self.report, &answers)?;
+        Ok(FfiImportApplied {
+            added: applied.added.len() as u64,
+            replaced: applied.replaced.len() as u64,
+            skipped: applied.skipped as u64,
+            groups_created: applied
+                .groups_created
+                .iter()
+                .map(|id| hex_id(id.as_bytes()))
+                .collect(),
+            groups_existing: applied
+                .groups_existing
+                .iter()
+                .map(|id| hex_id(id.as_bytes()))
+                .collect(),
+        })
+    }
+}
+
 /// What the user decided about one conflict.
 ///
 /// Mirrors [`qualia2fa_core::sync::Decision`].
@@ -5237,6 +5623,99 @@ mod tests {
             .code_for(hotp_id, NOW)
             .expect_err("an event-based entry has no clock to read");
         assert_eq!(error.kind(), "wrong_code_kind");
+    }
+
+    /// An export is previewed, compared and applied; no secret crosses the boundary while it is.
+    #[test]
+    fn an_export_previews_compares_and_applies() {
+        let keys = Arc::new(TestKeys::default());
+        let store = Arc::new(TestStore::default());
+        let vault = FfiVault::register(keys, store, "device-a".to_owned())
+            .expect("registration should succeed");
+
+        // The vault already holds "GitHub" with this secret; the export spells the same account
+        // differently and adds one the vault does not have.
+        let existing_id = vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("should add the entry");
+        let export = "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME\n\
+                      otpauth://totp/Bank:bob?secret=KRSXG5CTMVRXEZLU&issuer=Bank\n";
+
+        assert_eq!(
+            FfiImport::detect_format(export.as_bytes().to_vec()),
+            Some(FfiImportFormat::Text)
+        );
+        let import =
+            FfiImport::preview(export.as_bytes().to_vec(), FfiImportFormat::Text, None, NOW)
+                .expect("the export should be read");
+
+        let entries = import.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].position, 1);
+        assert_eq!(entries[0].account, "alice");
+        assert!(import.problems().is_empty());
+
+        let matches = import.compare(vault.clone());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(
+            matches[0].existing,
+            vec![existing_id.clone()],
+            "the same secret identifies the account"
+        );
+        assert!(!matches[0].identical, "the name differs");
+        assert!(matches[0].differences.contains(&"name".to_owned()));
+        assert!(matches[1].existing.is_empty(), "the second entry is new");
+
+        // The user keeps what the vault holds and adds only the second entry.
+        let applied = import
+            .apply(
+                vault.clone(),
+                vec![FfiImportChoice {
+                    position: 1,
+                    decision: FfiImportDecision::Skip,
+                }],
+            )
+            .expect("the import should apply");
+        assert_eq!(applied.added, 1);
+        assert_eq!(applied.skipped, 1);
+        assert_eq!(vault.entry_count(), 2);
+        assert_eq!(
+            vault.entry(existing_id).map(|entry| entry.name),
+            Some("GitHub".to_owned()),
+            "a skipped entry keeps what the vault held"
+        );
+
+        // Applying the same import again: the entry that was added the first time is skipped as
+        // an exact duplicate, while the one the user declined comes back as a question. That is
+        // the deliberate rule - a differing entry is never resolved automatically, because only
+        // a human can say whether "ACME:alice" and "GitHub" are the same account.
+        let again = import
+            .apply(vault.clone(), Vec::new())
+            .expect("applies again");
+        assert_eq!(again.added, 1);
+        assert_eq!(again.skipped, 1);
+        assert_eq!(vault.entry_count(), 3);
+
+        // Answered with Skip, it leaves the vault alone.
+        let settled = import
+            .apply(
+                vault.clone(),
+                vec![FfiImportChoice {
+                    position: 1,
+                    decision: FfiImportDecision::Skip,
+                }],
+            )
+            .expect("applies once more");
+        assert_eq!(settled.added, 0);
+        assert_eq!(settled.skipped, 2);
+        assert_eq!(vault.entry_count(), 3);
+
+        // An encrypted export without a password is refused rather than read as empty.
+        let encrypted = br#"{"version":1,"header":{"slots":[],"params":{}},"db":"AAAA"}"#;
+        assert!(
+            FfiImport::preview(encrypted.to_vec(), FfiImportFormat::Json, None, NOW).is_err(),
+            "an encrypted export needs a password"
+        );
     }
 
     /// Key material does not reach a `Debug` printout, which is where a panic message, a log
