@@ -558,18 +558,26 @@ pub enum FfiDigits {
     },
 }
 
-impl From<FfiDigits> for Digits {
-    fn from(value: FfiDigits) -> Self {
-        match value {
-            FfiDigits::Five => Digits::FIVE,
-            FfiDigits::Six => Digits::SIX,
-            FfiDigits::Seven => Digits::SEVEN,
-            FfiDigits::Eight => Digits::EIGHT,
-            FfiDigits::Nine => Digits::new(9).unwrap_or(Digits::SIX),
-            // The core rejects a count outside 1..=9, so this cannot panic and cannot be a
-            // silent rounding either: a value the core will not take becomes an error at the
-            // call site that builds the entry.
-            FfiDigits::Other { digits } => Digits::new(digits).unwrap_or(Digits::SIX),
+impl FfiDigits {
+    /// The digit count as the core models it.
+    ///
+    /// **Fallible on purpose.** A count outside 1..=9 is refused here rather than rounded to a
+    /// count the core accepts: an entry silently saved with six digits when the caller asked for
+    /// zero or ten produces codes that never match, and nothing on screen would say why. The
+    /// fallback this replaced did exactly that.
+    ///
+    /// # Errors
+    ///
+    /// The core's own [`Error::DigitsZero`] or [`Error::DigitsTooMany`], which say which count
+    /// was refused and why ten cannot be produced at all.
+    fn to_core(self) -> Result<Digits, FfiError> {
+        match self {
+            FfiDigits::Five => Ok(Digits::FIVE),
+            FfiDigits::Six => Ok(Digits::SIX),
+            FfiDigits::Seven => Ok(Digits::SEVEN),
+            FfiDigits::Eight => Ok(Digits::EIGHT),
+            FfiDigits::Nine => Ok(Digits::new(9).expect("nine is a digit count the core accepts")),
+            FfiDigits::Other { digits } => Ok(Digits::new(digits)?),
         }
     }
 }
@@ -851,7 +859,7 @@ pub fn serialize_otpauth_uri(auth: FfiOtpAuth) -> Result<String, FfiError> {
         issuer: auth.issuer,
         account: auth.account,
         algorithm: auth.algorithm.into(),
-        digits: auth.digits.into(),
+        digits: auth.digits.to_core()?,
     };
     Ok(uri::serialize(&core_auth)?)
 }
@@ -880,7 +888,7 @@ pub fn totp_code(
         unix_time,
         period,
         algorithm.into(),
-        digits.into(),
+        digits.to_core()?,
     )?)
 }
 
@@ -898,7 +906,7 @@ pub fn hotp_code(
         &secret,
         counter,
         algorithm.into(),
-        digits.into(),
+        digits.to_core()?,
     ))
 }
 
@@ -951,7 +959,7 @@ pub fn verify_code_with_drift(
         expected_counter,
         window,
         algorithm.into(),
-        digits.into(),
+        digits.to_core()?,
         &provided_code,
     ))
 }
@@ -2268,7 +2276,7 @@ impl FfiVaultEntry {
             self.account.clone(),
             secret,
             self.algorithm.into(),
-            self.digits.into(),
+            self.digits.to_core()?,
             self.kind.clone().into_core(existing)?,
             self.note.clone(),
             now,
