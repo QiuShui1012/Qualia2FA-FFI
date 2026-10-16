@@ -8,9 +8,13 @@ name: CI
 #   2. binding generation still working, since the application cannot build without it
 #   3. the unsafe surface not growing silently (`unsafe_code = "warn"`, raised to an error by `-D warnings`)
 
+# A branch pushed inside this repository starts **two** runs for the same commit: one for
+# the `push` and one for the `pull_request`. Only the second one is about the change under
+# review, so `push` is limited to `master` and every other change arrives through its pull
+# request. Branches in forks never produce a `push` run to begin with.
 on:
   push:
-    branches: ["**"]
+    branches: [master]
   pull_request:
 
 concurrency:
