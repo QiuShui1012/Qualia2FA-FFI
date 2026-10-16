@@ -26,6 +26,19 @@ updates:
         update-types:
           - minor
           - patch
+    # `uniffi` is not a dependency this repository may move on its own. Gobley generates
+    # the host-side bindings with uniffi 0.29.4, and the scaffolding the crate expands is
+    # not guaranteed to match a different version - so the pin in `Cargo.toml` is part of
+    # the interface, not a preference, and a bump proposal is noise at best and a broken
+    # binding at worst. The version moves when Gobley moves, in one change that also
+    # regenerates the bindings and runs them.
+    #
+    # Security updates are not affected by `ignore` (Dependabot opens those regardless), so
+    # an advisory against the pinned version still arrives - as it should, because a
+    # security fix and a binding change are then the same decision.
+    ignore:
+      - dependency-name: "uniffi"
+      - dependency-name: "uniffi_*"
 
   - package-ecosystem: github-actions
     directory: "/"
