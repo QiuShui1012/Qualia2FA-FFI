@@ -106,7 +106,7 @@ thiserror = "2"
 #
 # clap and camino therefore enter this crate's dependency tree for that binary
 # only, and are not linked into cdylib/staticlib.
-uniffi = { version = "=0.29.4", features = ["cli"] }
+uniffi = { version = "=0.32.2", features = ["cli"] }
 
 [dev-dependencies]
 # The tests need a real ECDSA P-256 implementation to play the host device
