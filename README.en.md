@@ -14,10 +14,10 @@ Kotlin and Swift to call.
 | License | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-OTP capabilities, the vault, recovery keys, registration/login, challenge-response and
-synchronization are exported. On top of that, this layer **implements the LAN channel itself**
-(multicast discovery plus an endpoint data plane) — that half is Rust-only, and no host-side
-implementation could reach it.
+OTP capabilities, the vault, groups and orderings, importing and exporting, recovery keys,
+registration/login, challenge-response and synchronization are exported. On top of that, this
+layer **implements the LAN channel itself** (multicast discovery plus an endpoint data plane) —
+that half is Rust-only, and no host-side implementation could reach it.
 
 ## Usage
 
@@ -121,6 +121,7 @@ the file" — the master key never appears in Kotlin/Swift as bytes even once.
 | `groups` / `groupOf(id)` | The groups and their orderings (the top group is always first) |
 | `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | Adds, renames, moves and removes groups (removing one keeps its entries) |
 | `setOrdering` / `assignToGroup` | Writes an ordering (the whole list) and moves an entry into a group |
+| `export(format, password)` | Writes the vault in a format another authenticator reads (see below) |
 | `exportRecoveryKey(passphrase, …)` | Exports a recovery key file |
 
 `updateEntry` and `removeEntry` differ by more than semantics: an update keeps the entry's
@@ -141,6 +142,26 @@ account, the algorithm, the digit count and the kind, and the kind arrives witho
 parsed export stays in Rust, which reads it back when the import is applied. **An entry with no
 answer is added, never overwritten** - losing a note the user wrote is worse than leaving a
 duplicate they can delete.
+
+### Exporting (`FfiVault.export`)
+
+`vault.export(format, password)` writes the whole vault and returns the file's bytes: **this layer
+does no I/O**, so where they go is the host side's save dialog. The four formats mirror the import
+exactly: `Text` (one URI per line), `Json`, `EncryptedJson` and `Html` (a QR code drawn for every
+entry). Three functions answer what the interface has to ask while the user picks a format:
+`exportFormatNeedsPassword`, `exportFormatExtension`, and `exportFormatCarriesGroups` (whether the
+groups and their order travel - **only the two JSON forms carry them**).
+
+**Only `EncryptedJson` protects anything.** The other three are as sensitive as the vault itself:
+the seeds are in there as they stand, and every QR code of the HTML form holds that entry's
+`otpauth://` URI with its secret. The interface has to say so before the file is written.
+
+**An empty password is refused** (`export_password_empty`), because it is one anybody can guess by
+trying nothing. The encryption is the format's own two stages: scrypt derives the slot key, the slot
+holds a random master key, and the master key encrypts the database with AES-256-GCM; every random
+value comes from the OS CSPRNG. The Rust side holds the vault's lock for the duration of an export
+(the whole vault is read once, and taking a snapshot would mean a second copy of every secret in
+memory).
 
 ### Registration and login
 
@@ -383,6 +404,9 @@ Three things a caller has to know:
   the user to retype it.
 - **Depends on `qualia2fa-core 0.2.0`**: vault format **3**, sync payload **3**, and no
   synchronization with 0.1.x at all - both devices have to be upgraded together.
+- **Depends on `qualia2fa-core 0.2.1`** (since 0.2.3): `export` and its three format functions are
+  new here, and 0.2.1 is also the release whose HTML reader takes the time step out of the QR
+  code - the two belong together.
 
 Once an FFI error crosses into Kotlin it is a `sealed class FfiException`:
 

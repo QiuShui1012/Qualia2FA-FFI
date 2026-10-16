@@ -305,6 +305,28 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::DeviceIdentityMismatch => "device_identity_mismatch",
         Error::SecureStoreWriteFailed { .. } => "secure_store_write_failed",
         Error::TimestampZero => "timestamp_zero",
+        // ── Another authenticator's files ──────────────────────────────────
+        //
+        // Both directions, because each one sends the user somewhere different: a file that is
+        // too large, one that nests too deeply, a password that is wrong rather than missing, an
+        // export that needs a password at all. A file-level failure is what the interface
+        // reports instead of a preview, so collapsing them into one kind would leave it unable
+        // to say which.
+        Error::ImportFileTooLarge { .. } => "import_file_too_large",
+        Error::ImportTooManyEntries { .. } => "import_too_many_entries",
+        Error::ImportTooDeeplyNested { .. } => "import_too_deeply_nested",
+        Error::ImportMalformed { .. } => "import_malformed",
+        Error::ImportUnsupportedVersion { .. } => "import_unsupported_version",
+        Error::ImportPasswordRequired => "import_password_required",
+        Error::ImportEncryptionUnsupported { .. } => "import_encryption_unsupported",
+        Error::ImportWrongPassword => "import_wrong_password",
+        Error::ImportCorrupted => "import_corrupted",
+        Error::ImportInvalidKdfParameters { .. } => "import_invalid_kdf_parameters",
+        Error::ExportPasswordRequired => "export_password_required",
+        Error::ExportPasswordEmpty => "export_password_empty",
+        Error::ExportQrTooLong { .. } => "export_qr_too_long",
+        Error::ExportTooLarge => "export_too_large",
+        Error::ExportParameterRefused { .. } => "export_parameter_refused",
         // ── Synchronization and the channel ────────────────────────────────
         //
         // The sync family is mapped as a whole rather than only the variants the current
@@ -4207,6 +4229,114 @@ pub fn detect_import_format(bytes: Vec<u8>) -> Option<FfiImportFormat> {
         qualia2fa_core::import::ImportFormat::Text => Some(FfiImportFormat::Text),
     }
 }
+// ── Writing an export ────────────────────────────────────────────────
+
+/// An export format the host side can choose.
+///
+/// The four are the shapes another authenticator reads. They are **not equally safe**: only
+/// [`FfiExportFormat::EncryptedJson`] protects anything, and the other three hold every secret
+/// in the vault as it stands, because that is what makes them readable by something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiExportFormat {
+    /// One `otpauth://` URI per line. Carries no name, no note and no group.
+    Text,
+    /// The JSON export: every field, the groups and their order included.
+    Json,
+    /// The JSON export, locked with a password.
+    EncryptedJson,
+    /// The HTML export: a table with a QR code drawn for every entry.
+    ///
+    /// The code is what makes this format usable one account at a time, and it is also why the
+    /// file is as sensitive as the vault: each code holds an entry's URI with its secret.
+    Html,
+}
+
+impl From<FfiExportFormat> for qualia2fa_core::export::ExportFormat {
+    fn from(value: FfiExportFormat) -> Self {
+        match value {
+            FfiExportFormat::Text => Self::Text,
+            FfiExportFormat::Json => Self::Json,
+            FfiExportFormat::EncryptedJson => Self::EncryptedJson,
+            FfiExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+/// Whether this format is written with a password.
+///
+/// Asked **before** the file is named, so that the password question appears where it belongs
+/// instead of being discovered from an error after the user has chosen a location.
+#[uniffi::export]
+#[must_use]
+pub fn export_format_needs_password(format: FfiExportFormat) -> bool {
+    qualia2fa_core::export::ExportFormat::from(format).needs_password()
+}
+
+/// The file name extension for this format, without the dot.
+///
+/// Both JSON forms share one: they are the same file with and without a password.
+#[uniffi::export]
+#[must_use]
+pub fn export_format_extension(format: FfiExportFormat) -> String {
+    qualia2fa_core::export::ExportFormat::from(format)
+        .extension()
+        .to_owned()
+}
+
+/// Whether this format carries the groups and the order inside them.
+///
+/// Only the JSON forms do. A caller uses it to say so in the interface rather than letting the
+/// user discover it after importing the file somewhere else.
+#[uniffi::export]
+#[must_use]
+pub fn export_format_carries_groups(format: FfiExportFormat) -> bool {
+    qualia2fa_core::export::ExportFormat::from(format).carries_groups()
+}
+
+#[uniffi::export]
+impl FfiVault {
+    /// Writes the whole vault out in one of the export formats.
+    ///
+    /// The bytes are returned rather than written anywhere: this library does no I/O, so where
+    /// the file goes is the host side's decision (the platform's own save dialog).
+    ///
+    /// # What crosses the boundary
+    ///
+    /// For the three plaintext formats, **every secret in the vault, in the clear**. That is
+    /// what an export is - the other application has to be able to read it - and it is why the
+    /// interface has to say so before the file is written. [`FfiExportFormat::EncryptedJson`]
+    /// with a password is the one form that protects anything; an empty password is refused
+    /// rather than accepted.
+    ///
+    /// # The lock is held for the whole call
+    ///
+    /// Deliberately, and unlike the entry methods: an export reads the entire vault, so it needs
+    /// one consistent view of it, and releasing the lock would mean copying the vault first -
+    /// a second copy of every secret in memory for as long as that copy lives. The cost is that
+    /// a concurrent refresh waits, and a user who has just asked for an export is not editing
+    /// entries at that moment.
+    ///
+    /// # Errors
+    ///
+    /// The core's kind reaches the host side: `export_password_required` when the encrypted form
+    /// was chosen with no password, `export_password_empty`, `uri_account_contains_colon` when an
+    /// entry's account cannot be written into a URI, `export_qr_too_long` when one entry's URI
+    /// does not fit the QR code of the HTML export, and `randomness_unavailable` when the OS
+    /// random source is unavailable (the salt, the master key and both nonces of the encrypted
+    /// form come from it).
+    pub fn export(
+        &self,
+        format: FfiExportFormat,
+        password: Option<String>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let password = password.map(String::into_bytes);
+        let vault = self.lock();
+        let bytes =
+            qualia2fa_core::export::export(vault.vault(), format.into(), password.as_deref())?;
+        Ok(bytes)
+    }
+}
+
 /// What the user decided about one conflict.
 ///
 /// Mirrors [`qualia2fa_core::sync::Decision`].
@@ -5668,6 +5798,34 @@ mod tests {
                 limit: 10,
             }),
             core_error_kind(&Error::TransportUnsupported { operation: "test" }),
+            // Another authenticator's files, in both directions. A file-level failure is what the
+            // interface shows instead of a preview, and the ways it can fail are the user's
+            // answers: choose the file again, choose another file, supply the password, correct
+            // the password, or re-export it from the other application.
+            core_error_kind(&Error::ImportFileTooLarge {
+                limit: 1,
+                actual: 2,
+            }),
+            core_error_kind(&Error::ImportTooManyEntries {
+                limit: 1,
+                actual: 2,
+            }),
+            core_error_kind(&Error::ImportTooDeeplyNested { limit: 1 }),
+            core_error_kind(&Error::ImportMalformed { reason: "test" }),
+            core_error_kind(&Error::ImportUnsupportedVersion {
+                version: 2,
+                supported: 1,
+            }),
+            core_error_kind(&Error::ImportPasswordRequired),
+            core_error_kind(&Error::ImportEncryptionUnsupported { reason: "test" }),
+            core_error_kind(&Error::ImportWrongPassword),
+            core_error_kind(&Error::ImportCorrupted),
+            core_error_kind(&Error::ImportInvalidKdfParameters { reason: "test" }),
+            core_error_kind(&Error::ExportPasswordRequired),
+            core_error_kind(&Error::ExportPasswordEmpty),
+            core_error_kind(&Error::ExportQrTooLong { position: 1 }),
+            core_error_kind(&Error::ExportTooLarge),
+            core_error_kind(&Error::ExportParameterRefused { parameter: "test" }),
             // The master key storage failures of the device identity library. Each one sends
             // the host side somewhere different, so each one needs a kind of its own: a blob
             // that will not unwrap wants a recovery path, a platform with no backend wants
@@ -5933,6 +6091,220 @@ mod tests {
         assert!(
             FfiImport::preview(encrypted.to_vec(), FfiImportFormat::Json, None, NOW).is_err(),
             "an encrypted export needs a password"
+        );
+    }
+
+    /// The kind of an entry without its PIN, which is what a read-back can be compared on.
+    ///
+    /// A URI carries a PIN and a JSON entry carries one, so an import that went through those
+    /// would disagree with the preview, which never hands a PIN back (see [`FfiEntryKind`]).
+    fn kind_shape(kind: &FfiEntryKind) -> FfiEntryKind {
+        match kind {
+            FfiEntryKind::Motp { period, .. } => FfiEntryKind::Motp {
+                period: *period,
+                pin: None,
+            },
+            FfiEntryKind::Yandex { period, .. } => FfiEntryKind::Yandex {
+                period: *period,
+                pin: None,
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The interface's questions about a format, answered without naming a file.
+    #[test]
+    fn the_export_formats_describe_themselves() {
+        assert!(export_format_needs_password(FfiExportFormat::EncryptedJson));
+        for format in [
+            FfiExportFormat::Text,
+            FfiExportFormat::Json,
+            FfiExportFormat::Html,
+        ] {
+            assert!(
+                !export_format_needs_password(format),
+                "{format:?} is written as it stands"
+            );
+        }
+
+        assert_eq!(export_format_extension(FfiExportFormat::Text), "txt");
+        assert_eq!(export_format_extension(FfiExportFormat::Json), "json");
+        assert_eq!(
+            export_format_extension(FfiExportFormat::EncryptedJson),
+            "json",
+            "both JSON forms are one file with and without a password"
+        );
+        assert_eq!(export_format_extension(FfiExportFormat::Html), "html");
+
+        assert!(export_format_carries_groups(FfiExportFormat::Json));
+        assert!(export_format_carries_groups(FfiExportFormat::EncryptedJson));
+        assert!(
+            !export_format_carries_groups(FfiExportFormat::Text),
+            "a list of URIs has nowhere to put a group"
+        );
+        assert!(!export_format_carries_groups(FfiExportFormat::Html));
+    }
+
+    /// Every kind the vault holds comes back out of every format, across the boundary.
+    ///
+    /// The export is the object the host side holds and the bytes are what it would write to a
+    /// file; the import is what it would do with that file. Both halves are exercised here, in
+    /// all four formats, because each one carries the fields differently - a URI has no name, a
+    /// table writes the mOTP secret in hexadecimal, and the encrypted form is a different shape
+    /// altogether.
+    #[test]
+    fn an_export_round_trips_across_the_boundary() {
+        let (vault, _) = registered_vault("device-a");
+        let written = [
+            sample_entry("GitHub"),
+            FfiVaultEntry {
+                kind: FfiEntryKind::Hotp { counter: 7 },
+                ..sample_entry("Bank")
+            },
+            FfiVaultEntry {
+                kind: FfiEntryKind::Steam,
+                digits: FfiDigits::Five,
+                ..sample_entry("Steam")
+            },
+            FfiVaultEntry {
+                kind: FfiEntryKind::Motp {
+                    period: 10,
+                    pin: Some("1234".to_owned()),
+                },
+                ..sample_entry("mOTP")
+            },
+            FfiVaultEntry {
+                kind: FfiEntryKind::Yandex {
+                    period: 30,
+                    pin: Some("1234".to_owned()),
+                },
+                secret_base32: "LA2V6KMCGYMWWVEW64RNP3JA3I".to_owned(),
+                ..sample_entry("Yandex")
+            },
+        ];
+        for entry in &written {
+            vault
+                .add_entry(entry.clone(), NOW)
+                .expect("the entry should be added");
+        }
+
+        for (format, import_format) in [
+            (FfiExportFormat::Text, FfiImportFormat::Text),
+            (FfiExportFormat::Json, FfiImportFormat::Json),
+            (FfiExportFormat::Html, FfiImportFormat::Html),
+            (FfiExportFormat::EncryptedJson, FfiImportFormat::Json),
+        ] {
+            let password = export_format_needs_password(format).then(|| "correct horse".to_owned());
+            let bytes = vault
+                .export(format, password.clone())
+                .unwrap_or_else(|error| panic!("{format:?} should be written: {error}"));
+            let import = FfiImport::preview(bytes, import_format, password, NOW)
+                .unwrap_or_else(|error| panic!("{format:?} should read back: {error}"));
+
+            assert!(
+                import.problems().is_empty(),
+                "{format:?} produced problems: {:?}",
+                import.problems()
+            );
+            let read = import.entries();
+            assert_eq!(read.len(), written.len(), "{format:?}");
+            for entry in &written {
+                let expected = kind_shape(&entry.kind);
+                assert!(
+                    read.iter().any(|one| kind_shape(&one.kind) == expected),
+                    "{format:?} came back without {expected:?}: {:?}",
+                    read.iter().map(|one| &one.kind).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// The encrypted form is the only one that hides anything, and it insists on a password.
+    #[test]
+    fn an_encrypted_export_needs_a_real_password() {
+        let (vault, _) = registered_vault("device-a");
+        vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("the entry should be added");
+
+        let missing = vault
+            .export(FfiExportFormat::EncryptedJson, None)
+            .expect_err("an encrypted export needs a password");
+        assert_eq!(missing.kind(), "export_password_required");
+
+        let empty = vault
+            .export(FfiExportFormat::EncryptedJson, Some(String::new()))
+            .expect_err("an empty password protects nothing");
+        assert_eq!(empty.kind(), "export_password_empty");
+
+        let bytes = vault
+            .export(
+                FfiExportFormat::EncryptedJson,
+                Some("correct horse".to_owned()),
+            )
+            .expect("the export should be written");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("JBSWY3DPEHPK3PXP"),
+            "the secret must not survive in the file as it stands"
+        );
+
+        let without = match FfiImport::preview(bytes.clone(), FfiImportFormat::Json, None, NOW) {
+            Err(error) => error,
+            Ok(_) => panic!("an encrypted export must not open without a password"),
+        };
+        assert_eq!(without.kind(), "import_password_required");
+
+        let wrong = match FfiImport::preview(
+            bytes.clone(),
+            FfiImportFormat::Json,
+            Some("correct horsf".to_owned()),
+            NOW,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a wrong password must not open the file"),
+        };
+        assert_eq!(wrong.kind(), "import_wrong_password");
+
+        let opened = FfiImport::preview(
+            bytes,
+            FfiImportFormat::Json,
+            Some("correct horse".to_owned()),
+            NOW,
+        )
+        .expect("the password opens it");
+        assert_eq!(opened.entries().len(), 1);
+    }
+
+    /// A step that is not the default survives an HTML export and import.
+    ///
+    /// This is the pair of changes that only works together: the writer draws the step into the
+    /// QR code, and the reader takes it back out. A default step would come back as 30 and the
+    /// codes the user sees would never match the ones the other application shows.
+    #[test]
+    fn an_exported_html_file_keeps_a_step_that_is_not_the_default() {
+        let (vault, _) = registered_vault("device-a");
+        vault
+            .add_entry(
+                FfiVaultEntry {
+                    kind: FfiEntryKind::Totp { period: 90 },
+                    ..sample_entry("GitHub")
+                },
+                NOW,
+            )
+            .expect("the entry should be added");
+
+        let bytes = vault
+            .export(FfiExportFormat::Html, None)
+            .expect("the export should be written");
+        let import = FfiImport::preview(bytes, FfiImportFormat::Html, None, NOW)
+            .expect("the export should read back");
+        let read = import.entries();
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].kind, FfiEntryKind::Totp { period: 90 });
+        assert!(
+            !read[0].period_assumed,
+            "the step was in the code, so nothing was assumed"
         );
     }
 

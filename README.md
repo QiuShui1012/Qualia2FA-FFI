@@ -13,7 +13,7 @@ English version: [README.en.md](README.en.md).
 | 许可证 | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-已导出 OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）、保险库、分组与排序、导入、
+已导出 OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）、保险库、分组与排序、导入与导出、
 恢复密钥、注册/登录、挑战-应答与同步。除此之外，本层还**自己实现**了局域网通道（组播发现 +
 端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
 
@@ -111,6 +111,7 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 | `groups` / `groupOf(id)` | 分组与它们的排序（顶分组永远在第一个） |
 | `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | 分组的增删改名与排序（删组不删条目） |
 | `setOrdering` / `assignToGroup` | 写排序（整份列表）与把条目移进某个分组 |
+| `export(format, password)` | 导出成别人的认证器能读的格式（见下） |
 | `exportRecoveryKey(passphrase, …)` | 导出恢复密钥文件 |
 
 `updateEntry` 与 `removeEntry` 的区别不只是语义：修改保留条目标识，删除留下墓碑。
@@ -126,6 +127,21 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 **密钥与 PIN 都不跨界**：`FfiImportedEntry` 只有名字、服务、账号、算法、位数与种类，而种类里的 PIN
 是空的；解析后的导出留在 Rust 侧，应用时由它自己读回来。**没给答案的条目一律是「加入」**，绝不覆盖
 ——丢掉用户写过的备注，比留下一条他能删掉的重复更糟。
+
+### 导出（`FfiVault.export`）
+
+`vault.export(format, password)` 写出整份保险库并返回文件字节：**本层不做 I/O**，写到哪里由端侧
+的保存对话框决定。四种格式与导入一一对应：`Text`（每行一个 URI）、`Json`、`EncryptedJson`、
+`Html`（每个条目画一张二维码）。界面在选格式时要问的三件事各有一个函数：`exportFormatNeedsPassword`
+（要不要口令）、`exportFormatExtension`（文件叫什么）、`exportFormatCarriesGroups`
+（分组与排序能不能带过去——**只有两种 JSON 能**）。
+
+**只有 `EncryptedJson` 保护任何东西。** 另外三种与保险库本身一样敏感：明文种子就在里面，
+`Html` 每张二维码里就是那条目的 `otpauth://` URI（含密钥）。写文件之前界面必须把这件事说清楚。
+
+**空口令会被拒绝**（`export_password_empty`），它等于谁都能打开。加密走格式自己的两段式：
+scrypt 导出槽密钥、槽里放随机主密钥、主密钥用 AES-256-GCM 加密数据库，所有随机值都来自 OS CSPRNG。
+导出期间 Rust 侧持有保险库的锁（整份保险库要读一遍，取快照等于在内存里多一份全部密钥的副本）。
 
 ### 注册与登录
 
@@ -344,6 +360,8 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
   `pin: None` 表示**保留原有 PIN**，所以编辑备注不需要用户重输。
 - **依赖 `qualia2fa-core 0.2.0`**：保险库格式 **3**、同步载荷 **3**，与 0.1.x **无法同步**，
   两端必须一起升级。
+- **依赖 `qualia2fa-core 0.2.1`**（自 0.2.3 起）：`export` 与它的三个格式函数是这一版新增的；
+  0.2.1 也是 HTML 读取端能从二维码里取出步长的那一版，两者配套。
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 

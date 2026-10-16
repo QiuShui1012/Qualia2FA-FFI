@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
@@ -42,7 +42,11 @@ crate-type = ["cdylib", "staticlib"]
 # `qualia2fa-core`. Local builds, CI and third-party consumers therefore
 # resolve the same source, and this repository checks nothing out: the nested
 # `Core/` submodule was removed together with the path dependency.
-qualia2fa-core = "0.2.0"
+#
+# 0.2.1 is the first release that can write an export, and it is also the one whose HTML reader
+# takes the time step out of the QR code an export draws - so the export screen and the import
+# preview of an HTML file both need it.
+qualia2fa-core = "0.2.1"
 
 # The code channel and the LAN channel. The host draws a pairing payload (or an entry) as a
 # QR code and reads one back from an image the user imported; and the LAN half — multicast
