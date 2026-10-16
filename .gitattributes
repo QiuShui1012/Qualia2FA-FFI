@@ -1,11 +1,32 @@
-# 统一为 LF，避免在 Windows 上签出 CRLF 导致许可证正文与生成绑定出现
-# 无意义的整文件差异。
+# Store everything with LF, and check it out with LF on every platform.
+#
+# Two reasons: the license texts (LICENSE, COPYING.LESSER) must stay byte-identical to
+# the official wording, and a checkout that rewrites line endings makes every file look
+# modified for no reason.
 * text=auto eol=lf
 
-# 故意的例外：`.dll`/`.so`/`.dylib` 等二进制（当前不入库，仅供将来参考）
-*.dll binary
-*.so binary
+# Windows batch files are the one exception: cmd.exe parses them poorly when they use LF,
+# which shows up as a wrapper script that fails on a label it cannot find.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files: no end-of-line conversion, no merge attempts.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.pdf   binary
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.so    binary
 *.dylib binary
-*.lib binary
-*.a binary
-*.pdb binary
+*.a     binary
+*.pdb   binary
+
+# Rust sources: highlight them as Rust when diffing.
+*.rs diff=rust
