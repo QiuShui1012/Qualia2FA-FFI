@@ -1,21 +1,43 @@
+<div align="center" style="align-items: center">
+
 # Qualia2FA-FFI
 
-English version: [README.en.md](README.en.md).
+简体中文 | [English](README.en.md)
 
-把 [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) 暴露为
-[UniFFI](https://mozilla.github.io/uniffi-rs/) 绑定，供 Kotlin、Swift 等托管语言调用。
+把 [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) 暴露为 [UniFFI](https://mozilla.github.io/uniffi-rs/) 绑定，供 Kotlin、Swift 等托管语言调用。
 
-| 项 | 值 |
-|---|---|
-| Crate 名 | `qualia2fa-ffi` |
-| 类型 | `cdylib` + `staticlib`（另有 `uniffi-bindgen` 二进制） |
-| Edition | 2024 |
-| 许可证 | `LGPL-3.0-or-later` |
-| UniFFI | **`0.29`** |
+[![License](https://img.shields.io/github/license/Qualia2FA/Qualia2FA-FFI?label=License)][License]
+[![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-FFI/total?logo=github&label=Downloads)][Releases]
+[![crates.io](https://img.shields.io/crates/d/qualia2fa-ffi?logo=crates.io&label=crates.io+Downloads)][crates.io]
 
-已导出 OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）、保险库、分组与排序、导入与导出、
-恢复密钥、注册/登录、挑战-应答与同步。除此之外，本层还**自己实现**了局域网通道（组播发现 +
-端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
+[License]: LICENSE
+
+[Releases]: https://github.com/Qualia2FA/Qualia2FA-FFI/releases
+
+[crates.io]: https://crates.io/crates/qualia2fa-ffi
+
+</div>
+
+---
+
+| 项       | 值                                                     |
+|----------|--------------------------------------------------------|
+| Crate 名 | `qualia2fa-ffi`                                        |
+| 类型     | `cdylib` + `staticlib`（另有 `uniffi-bindgen` 二进制） |
+| Edition  | 2024                                                   |
+| 许可证   | `LGPL-3.0-or-later`                                    |
+| UniFFI   | **`0.29`**                                             |
+
+已导出如下功能：
+- OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）
+- 保险库
+- 分组与排序
+- 导入与导出
+- 恢复密钥
+- 注册/登录
+- 挑战-应答与同步
+
+除此之外，本层还**自己实现**了局域网通道（组播发现 + 端点数据面）——那一半只在 Rust 侧可用，端侧实现不了。
 
 ## 用法
 
@@ -76,17 +98,17 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 
 ### 验证码
 
-| 函数 | 说明 |
-|---|---|
-| `parse_otpauth_uri` | 解析 `otpauth://` URI |
-| `serialize_otpauth_uri` | 序列化回 URI（账号名含 `:` 会被拒绝） |
-| `totp_code` / `hotp_code` | 计算验证码 |
-| `steam_guard_code` | Steam Guard 5 位字母表 |
-| `verify_code_with_drift` | 容错校验，返回命中的偏移量便于时钟校准 |
-| `codes_match` | 常量时间比较 |
-| `generate_secret_base32` | 生成 256 位随机种子（OS CSPRNG） |
-| `recommended_min_secret_len` / `is_secret_shorter_than_recommended` / `secret_byte_len` | 种子强度提示 |
-| `core_version` | 核心版本，供兼容性检查 |
+| 函数                                                                                    | 说明                                   |
+|-----------------------------------------------------------------------------------------|----------------------------------------|
+| `parse_otpauth_uri`                                                                     | 解析 `otpauth://` URI                  |
+| `serialize_otpauth_uri`                                                                 | 序列化回 URI（账号名含 `:` 会被拒绝）  |
+| `totp_code` / `hotp_code`                                                               | 计算验证码                             |
+| `steam_guard_code`                                                                      | Steam Guard 5 位字母表                 |
+| `verify_code_with_drift`                                                                | 容错校验，返回命中的偏移量便于时钟校准 |
+| `codes_match`                                                                           | 常量时间比较                           |
+| `generate_secret_base32`                                                                | 生成 256 位随机种子（OS CSPRNG）       |
+| `recommended_min_secret_len` / `is_secret_shorter_than_recommended` / `secret_byte_len` | 种子强度提示                           |
+| `core_version`                                                                          | 核心版本，供兼容性检查                 |
 
 **时间一律由调用方传入。** 核心不读时钟，只有时间作为参数传入，RFC 6238 的
 测试向量才能被确定性地验证。端侧应传系统时钟的 Unix 秒数。
@@ -96,30 +118,30 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 条目本身由 `FfiVault` 持有，**主密钥留在 Rust 侧**。「打开 → 列条目 → 改条目 →
 存回文件」这条最常见的路径上，主密钥一次都不会以字节形式出现在 Kotlin/Swift 里。
 
-| 方法 | 说明 |
-|---|---|
-| `FfiVault.register(keys, store, label)` | 生成主密钥、取得设备身份、写入平台密钥库 |
-| `FfiVault.open(store, data)` | 用密钥库里的主密钥打开保险库文件 |
-| `FfiVault.fromMasterKey(bytes)` | 用已有主密钥建立空保险库（登录/恢复之后用） |
-| `entryCount` / `isEmpty` / `tombstoneCount` | 计数 |
-| `entries` / `entry(id)` | 读取条目（**顺序不保证**，列表请自行排序） |
-| `addEntry(entry, now)` → `id` | 新增 |
-| `updateEntry(entry, now)` | 修改（**标识不变、不留墓碑**） |
-| `removeEntry(id, now)` → `Bool` | 删除（留墓碑） |
-| `serialize` | 序列化，供端侧**原子地**落盘 |
-| `codeFor(id, now)` / `hotpFor(id, counter)` | 按**条目的种类**算验证码 |
-| `groups` / `groupOf(id)` | 分组与它们的排序（顶分组永远在第一个） |
-| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | 分组的增删改名与排序（删组不删条目） |
-| `setOrdering` / `assignToGroup` | 写排序（整份列表）与把条目移进某个分组 |
-| `export(format, password)` | 导出成别人的认证器能读的格式（见下） |
-| `exportRecoveryKey(passphrase, …)` | 导出恢复密钥文件 |
+| 方法                                                        | 说明                                        |
+|-------------------------------------------------------------|---------------------------------------------|
+| `FfiVault.register(keys, store, label)`                     | 生成主密钥、取得设备身份、写入平台密钥库    |
+| `FfiVault.open(store, data)`                                | 用密钥库里的主密钥打开保险库文件            |
+| `FfiVault.fromMasterKey(bytes)`                             | 用已有主密钥建立空保险库（登录/恢复之后用） |
+| `entryCount` / `isEmpty` / `tombstoneCount`                 | 计数                                        |
+| `entries` / `entry(id)`                                     | 读取条目（**顺序不保证**，列表请自行排序）  |
+| `addEntry(entry, now)` → `id`                               | 新增                                        |
+| `updateEntry(entry, now)`                                   | 修改（**标识不变、不留墓碑**）              |
+| `removeEntry(id, now)` → `Bool`                             | 删除（留墓碑）                              |
+| `serialize`                                                 | 序列化，供端侧**原子地**落盘                |
+| `codeFor(id, now)` / `hotpFor(id, counter)`                 | 按**条目的种类**算验证码                    |
+| `groups` / `groupOf(id)`                                    | 分组与它们的排序（顶分组永远在第一个）      |
+| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | 分组的增删改名与排序（删组不删条目）        |
+| `setOrdering` / `assignToGroup`                             | 写排序（整份列表）与把条目移进某个分组      |
+| `export(format, password)`                                  | 导出成别人的认证器能读的格式（见下）        |
+| `exportRecoveryKey(passphrase, …)`                          | 导出恢复密钥文件                            |
 
 `updateEntry` 与 `removeEntry` 的区别不只是语义：修改保留条目标识，删除留下墓碑。
 两者在另一台设备上被读成完全不同的操作，因此**不要**用「删除 + 新增」实现修改。
 
 ### 导入（`FfiImport`）
 
-从别的认证器导入一份导出：`FfiImport.preview(bytes, format, password, now)` 读它（JSON、HTML，
+导入一份来自 Qualia2FA / Aegis 的导出：`FfiImport.preview(bytes, format, password, now)` 读它（JSON、HTML，
 或每行一个 URI；加密的 JSON 需要口令），`detectFormat(bytes)` 也可以先从内容猜格式。返回的对象上，
 `entries` / `problems` / `groups` / `dropped` 是预览要显示的东西，`compare(vault)` 说出「哪些已经有
 了、哪些共享同一把密钥但字段不同（要人来定）」，`apply(vault, choices)` 落实答案。
@@ -161,16 +183,16 @@ val reply = login.authorize(oldVault, request)   // 界面在这里必须先让�
 val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 ```
 
-| 方法 | 说明 |
-|---|---|
-| `FfiLogin.begin()` / `payload()` | 发起登录，取得二维码文本 |
-| `FfiLogin.authorize(vault, msg1)` | 授权（**调用即交出主密钥**，界面须先确认） |
-| `FfiLogin.joinerDeviceId()` | 请求方的设备标识，显示给用户核对 |
-| `FfiJoiner.fromQr(text, label)` | 扫码建立会话 |
-| `FfiJoiner.request(keys)` | 发出请求（幂等） |
-| `FfiJoiner.identity()` | 本机身份，完成之前才有值 |
-| `FfiJoiner.complete(msg2, keys, store)` | 验证应答、取回主密钥、写入密钥库 |
-| `FfiPlatformKeys.open(label)` | 打开平台密钥库里的设备身份（Windows 上是 CNG/TPM，没有 TPM 时是 CNG 软件库）。它把 `qualia-dik` 的实现搬到边界这一侧，host 只需写一层不含判断的转发去实现 `FfiDeviceKeys`；`backend()` 如实报告实际拿到的是哪一种 |
+| 方法                                    | 说明                                                                                                                                                                                                              |
+|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `FfiLogin.begin()` / `payload()`        | 发起登录，取得二维码文本                                                                                                                                                                                          |
+| `FfiLogin.authorize(vault, msg1)`       | 授权（**调用即交出主密钥**，界面须先确认）                                                                                                                                                                        |
+| `FfiLogin.joinerDeviceId()`             | 请求方的设备标识，显示给用户核对                                                                                                                                                                                  |
+| `FfiJoiner.fromQr(text, label)`         | 扫码建立会话                                                                                                                                                                                                      |
+| `FfiJoiner.request(keys)`               | 发出请求（幂等）                                                                                                                                                                                                  |
+| `FfiJoiner.identity()`                  | 本机身份，完成之前才有值                                                                                                                                                                                          |
+| `FfiJoiner.complete(msg2, keys, store)` | 验证应答、取回主密钥、写入密钥库                                                                                                                                                                                  |
+| `FfiPlatformKeys.open(label)`           | 打开平台密钥库里的设备身份（Windows 上是 CNG/TPM，没有 TPM 时是 CNG 软件库）。它把 `qualia-dik` 的实现搬到边界这一侧，host 只需写一层不含判断的转发去实现 `FfiDeviceKeys`；`backend()` 如实报告实际拿到的是哪一种 |
 
 一次登录只能完成一次。第二次调用报的是**与「应答是伪造的」相同的错误**，这是故意
 的——单独报「已经用过了」等于告诉重放者他被认出来了。端侧文案也应保持笼统。
@@ -179,11 +201,11 @@ val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 
 主密钥在平台上只有两种存法，**用哪个对象去问就是选择，没有模式参数**：
 
-| 方法 | 说明 |
-|---|---|
-| `FfiDirectMasterKeyStore.open()` | 打开「平台库直接持有材料」的那一种（Windows 上是 CNG，Android 上是 Keystore）：`store(label, key)` / `load(label)` / `delete(label)`，端侧不为它持久化任何东西 |
-| `FfiWrappedMasterKeyStore.open()` | 打开「平台库持有一把不可导出的 KEK」的那一种：`store(label, key)` **返回要由端侧持久化的包裹字节**，`load(label, wrapped)` 把它们收回来，`delete(label)` 删掉 KEK（先前那些字节随之永久作废） |
-| `backend()` / `isHardwareBacked()` | 如实报告实际答话的后端（`"tpm"` / `"android-keystore"` / `"software"` / `"secure-enclave"` / `"unavailable"`），端侧应在依赖它之前把这一点告诉用户 |
+| 方法                               | 说明                                                                                                                                                                                          |
+|------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `FfiDirectMasterKeyStore.open()`   | 打开「平台库直接持有材料」的那一种（Windows 上是 CNG，Android 上是 Keystore）：`store(label, key)` / `load(label)` / `delete(label)`，端侧不为它持久化任何东西                                |
+| `FfiWrappedMasterKeyStore.open()`  | 打开「平台库持有一把不可导出的 KEK」的那一种：`store(label, key)` **返回要由端侧持久化的包裹字节**，`load(label, wrapped)` 把它们收回来，`delete(label)` 删掉 KEK（先前那些字节随之永久作废） |
+| `backend()` / `isHardwareBacked()` | 如实报告实际答话的后端（`"tpm"` / `"android-keystore"` / `"software"` / `"secure-enclave"` / `"unavailable"`），端侧应在依赖它之前把这一点告诉用户                                            |
 
 主密钥**只以字节过边界**（32 字节进、32 字节出），既不进日志也不进错误消息；拿到之后
 端侧应立刻丢弃，或直接用 `FfiVault.fromMasterKey` 建保险库。包裹形式交出的字节是不透明
@@ -194,12 +216,12 @@ val masterKey = joiner.complete(reply, deviceKeys, secureStore)
 
 ### 恢复密钥
 
-| 函数 | 说明 |
-|---|---|
-| `FfiVault.exportRecoveryKey` | 设备已解锁时导出（主密钥不过边界） |
-| `exportRecoveryKeyFromMaster` | 只有主密钥字节时导出 |
-| `importRecoveryKey(file, passphrase, store)` | 导入并写入密钥库，返回主密钥 |
-| `storeMasterKey(bytes, store)` | 单独保存主密钥 |
+| 函数                                         | 说明                               |
+|----------------------------------------------|------------------------------------|
+| `FfiVault.exportRecoveryKey`                 | 设备已解锁时导出（主密钥不过边界） |
+| `exportRecoveryKeyFromMaster`                | 只有主密钥字节时导出               |
+| `importRecoveryKey(file, passphrase, store)` | 导入并写入密钥库，返回主密钥       |
+| `storeMasterKey(bytes, store)`               | 单独保存主密钥                     |
 
 KDF 参数（`memory_kib` / `iterations` / `parallelism`）传 `null` 用推荐值
 （64 MiB / 3 次 / 1 路）。**不要为了「快」调低**：导出是一次性开销，而拿到文件的
@@ -256,15 +278,15 @@ if (outcome.needsAdjudication) {
 vault.serialize()?.let(::saveVault)     // 合并写进了保险库，必须落盘
 ```
 
-| 成员 | 说明 |
-|---|---|
-| `FfiSyncSession.open(vault)` | 在一个已解锁的保险库上开会话 |
-| `send(transport, to, kind)` → `syncId` | 封装并发出（`Vault` = 自己的全部状态，`Request` = 「把你的发给我」） |
-| `receive(transport)` → `FfiSyncOutcome` | 读入一条消息并合并；失败时保险库与重放日志都不变 |
-| `pendingConflicts()` | 还没裁决的冲突，按合并报告的先后排列 |
-| `adjudicate(entryId, decision)` | 裁决一条，**按标识而不是下标**（下标会在裁决后移位） |
-| `planShare(transport)` | 只回答装不装得下，不发送也不显示 |
-| `FfiPlatformKeys.deviceId()` | 本机设备标识，通道要如实报告它 |
+| 成员                                    | 说明                                                                 |
+|-----------------------------------------|----------------------------------------------------------------------|
+| `FfiSyncSession.open(vault)`            | 在一个已解锁的保险库上开会话                                         |
+| `send(transport, to, kind)` → `syncId`  | 封装并发出（`Vault` = 自己的全部状态，`Request` = 「把你的发给我」） |
+| `receive(transport)` → `FfiSyncOutcome` | 读入一条消息并合并；失败时保险库与重放日志都不变                     |
+| `pendingConflicts()`                    | 还没裁决的冲突，按合并报告的先后排列                                 |
+| `adjudicate(entryId, decision)`         | 裁决一条，**按标识而不是下标**（下标会在裁决后移位）                 |
+| `planShare(transport)`                  | 只回答装不装得下，不发送也不显示                                     |
+| `FfiPlatformKeys.deviceId()`            | 本机设备标识，通道要如实报告它                                       |
 
 `FfiTransport` 的实现要求与核心 `Transport` 一致：**如实报告发送方**（核心会拿它和
 载荷里那个认证过的字段对账）、尊重 `FfiRecipient.One`、没有消息时返回 `null` 而不是
@@ -273,11 +295,11 @@ vault.serialize()?.let(::saveVault)     // 合并写进了保险库，必须落�
 
 冲突的 `kind` 是稳定字符串，端侧对未知值要有兜底分支：
 
-| kind | 含义 | 两个选择 |
-|---|---|---|
-| `entry_mismatch` | 两边都有这条条目，内容不同 | 保留本机版本 / 采用对方版本 |
-| `peer_deleted` | 对方删除了它，本机改过它并留着 | 保留条目 / 接受删除 |
-| `local_deleted` | 本机删除了它，对方还留着 | 保持删除 / 恢复条目 |
+| kind             | 含义                           | 两个选择                    |
+|------------------|--------------------------------|-----------------------------|
+| `entry_mismatch` | 两边都有这条条目，内容不同     | 保留本机版本 / 采用对方版本 |
+| `peer_deleted`   | 对方删除了它，本机改过它并留着 | 保留条目 / 接受删除         |
+| `local_deleted`  | 本机删除了它，对方还留着       | 保持删除 / 恢复条目         |
 
 > **裁决只作用于本机。** 「采用对方版本」会真正写进保险库，所以**必须落盘**；
 > 「保留本机版本」不会让分歧消失——对方仍持有另一版，轮到它同步时它会问它的用户。
@@ -316,19 +338,19 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
 网段、或组播被禁），记录仍然说得清**要找谁**，但说不出**去哪里找**：`rememberPeer` 还需
 一个可拨的地址，而那个地址只有收到过对方报文的一方才有。
 
-| 成员 | 说明 |
-|---|---|
-| `FfiLanChannel.open(deviceId)` | 打开端点，端口由系统选；**端点密钥每次运行重新生成、不落盘** |
-| `record()` | 本端点的连接记录（端点公钥 + 端口，42 字节定长），交给配对码或别的带外通道 |
-| `rememberPeer(deviceId, record, socket)` | 登记一个可拨的对端；`socket` 只有 **IP** 有用，**端口以记录为准** |
-| `forgetPeer(deviceId)` | 忘记该对端并关闭到它的连接 |
-| `transport()` | 把本对象作为 `FfiTransport` 交给会话 |
-| `openLobby()` | 开始公告与收听，返回 `FfiLanLobby` |
-| `shutdown()` | 关闭端点：连接全关、运行时停止；重复调用安全 |
-| `FfiLanLobby.peers()` | 已知的对端，**含已经离开的**（`here` 为 false） |
-| `FfiLanLobby.announceNow()` | 立刻公告一次，不等下一个周期 |
-| `FfiLanLobby.shutdown()` | 一次告别，然后停掉线程与 socket；重复调用安全 |
-| `FfiLanPeer` | `deviceId` / `record` / `socket`（可拨地址 `ip:port`：IP 来自收到报文的那一方、端口是端点公告的那个；可能为 `null`）/ `here` |
+| 成员                                     | 说明                                                                                                                         |
+|------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| `FfiLanChannel.open(deviceId)`           | 打开端点，端口由系统选；**端点密钥每次运行重新生成、不落盘**                                                                 |
+| `record()`                               | 本端点的连接记录（端点公钥 + 端口，42 字节定长），交给配对码或别的带外通道                                                   |
+| `rememberPeer(deviceId, record, socket)` | 登记一个可拨的对端；`socket` 只有 **IP** 有用，**端口以记录为准**                                                            |
+| `forgetPeer(deviceId)`                   | 忘记该对端并关闭到它的连接                                                                                                   |
+| `transport()`                            | 把本对象作为 `FfiTransport` 交给会话                                                                                         |
+| `openLobby()`                            | 开始公告与收听，返回 `FfiLanLobby`                                                                                           |
+| `shutdown()`                             | 关闭端点：连接全关、运行时停止；重复调用安全                                                                                 |
+| `FfiLanLobby.peers()`                    | 已知的对端，**含已经离开的**（`here` 为 false）                                                                              |
+| `FfiLanLobby.announceNow()`              | 立刻公告一次，不等下一个周期                                                                                                 |
+| `FfiLanLobby.shutdown()`                 | 一次告别，然后停掉线程与 socket；重复调用安全                                                                                |
+| `FfiLanPeer`                             | `deviceId` / `record` / `socket`（可拨地址 `ip:port`：IP 来自收到报文的那一方、端口是端点公告的那个；可能为 `null`）/ `here` |
 
 三件使用者必须知道的事：
 
@@ -368,14 +390,14 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
 
 FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 
-| 变体 | 含义 |
-|---|---|
-| `InputTooLong` | 输入超过边界上限 |
-| `Core` | 核心返回的错误，结构化为 `FfiCoreError { kind, message }` |
-| `Qr` | 二维码那一半的通道自身报出的失败（`kind` + `detail`），例如图片里读不出码 |
-| `Lan` | 局域网通道自身报出的失败（`kind` + `detail`），例如加入不了组播组、对端没有登记过 |
-| `InvalidDeviceId` | 传进来的设备标识不是 64 位十六进制 |
-| `UnknownConflict` | 为一条不在等待裁决的冲突做了裁决：裁决只属于产生它的那次合并 |
+| 变体              | 含义                                                                              |
+|-------------------|-----------------------------------------------------------------------------------|
+| `InputTooLong`    | 输入超过边界上限                                                                  |
+| `Core`            | 核心返回的错误，结构化为 `FfiCoreError { kind, message }`                         |
+| `Qr`              | 二维码那一半的通道自身报出的失败（`kind` + `detail`），例如图片里读不出码         |
+| `Lan`             | 局域网通道自身报出的失败（`kind` + `detail`），例如加入不了组播组、对端没有登记过 |
+| `InvalidDeviceId` | 传进来的设备标识不是 64 位十六进制                                                |
+| `UnknownConflict` | 为一条不在等待裁决的冲突做了裁决：裁决只属于产生它的那次合并                      |
 
 `Lan` 的 `kind` 与 `Qr` 一样是稳定标识，常见的几个：`lan_socket`（端点没有绑定的 socket）、
 `lan_transport`（运行时或绑定失败）、`no_connection_to_peer`（对端没登记过或连不上）、
@@ -394,14 +416,14 @@ FFI 错误跨到 Kotlin 后是 `sealed class FfiException`：
 
 有几组 `kind` 是刻意分开的，合并它们会造成用户可见的错误：
 
-| kind | 不要与它合并 | 合并的后果 |
-|---|---|---|
-| `device_not_registered` | `vault_decryption_failed` | 用户被引导重新注册，原有条目永久丢失 |
-| `vault_entry_not_found` | 「保险库为空」 | 显示空列表，而用户刚才还在看条目 |
-| `recovery_authentication_failed` | `recovery_file_malformed` | 用户反复试口令，而问题不在口令 |
-| `pairing_authentication_failed` | 任何更具体的错误 | 给攻击者一个「差一点就成功」的预言机 |
-| `sync_already_applied` | `sync_authentication_failed` | 把「已经合并过」报成「这个码是假的」，用户会去重新生成一个本来没问题的码 |
-| `sync_sender_mismatch` | `sync_authentication_failed` | 把「来源对不上」报成「密钥不对」，排查方向完全错 |
+| kind                             | 不要与它合并                 | 合并的后果                                                               |
+|----------------------------------|------------------------------|--------------------------------------------------------------------------|
+| `device_not_registered`          | `vault_decryption_failed`    | 用户被引导重新注册，原有条目永久丢失                                     |
+| `vault_entry_not_found`          | 「保险库为空」               | 显示空列表，而用户刚才还在看条目                                         |
+| `recovery_authentication_failed` | `recovery_file_malformed`    | 用户反复试口令，而问题不在口令                                           |
+| `pairing_authentication_failed`  | 任何更具体的错误             | 给攻击者一个「差一点就成功」的预言机                                     |
+| `sync_already_applied`           | `sync_authentication_failed` | 把「已经合并过」报成「这个码是假的」，用户会去重新生成一个本来没问题的码 |
+| `sync_sender_mismatch`           | `sync_authentication_failed` | 把「来源对不上」报成「密钥不对」，排查方向完全错                         |
 
 `pairing_authentication_failed` 覆盖密文被改、会话对不上、应答来自另一次登录等
 多种成因，**这是刻意的**。端侧文案应当保持笼统（「配对失败，请重新扫码」），不要
@@ -464,10 +486,10 @@ try {
 （裸指针解引用、`catch_unwind`、字符串所有权转移）。**FFI 边界本身就是 unsafe
 的**，这是不可协商的。安全边界因此划在 **crate 之间**：
 
-| crate | 约束 |
-|---|---|
+| crate            | 约束                                      |
+|------------------|-------------------------------------------|
 | `qualia2fa-core` | `#![forbid(unsafe_code)]`，无 I/O，无时钟 |
-| `qualia2fa-ffi` | 唯一允许 `unsafe` 的地方，且必须是薄的 |
+| `qualia2fa-ffi`  | 唯一允许 `unsafe` 的地方，且必须是薄的    |
 
 `Cargo.toml` 里把 `unsafe_code` 设为 `warn` 而非 `allow`，是为了让任何**新增**的
 `unsafe` 在构建时发出声音；CI 用 `-D warnings` 把它上升为硬错误。

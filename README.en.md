@@ -1,10 +1,26 @@
+<div align="center" style="align-items: center">
+
 # Qualia2FA-FFI
 
-中文版见 [README.md](README.md).
+[简体中文](README.md) | English
 
 Exposes [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) as
 [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings, for managed languages such as
 Kotlin and Swift to call.
+
+[![License](https://img.shields.io/github/license/Qualia2FA/Qualia2FA-FFI?label=License)][License]
+[![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-FFI/total?logo=github&label=Downloads)][Releases]
+[![crates.io](https://img.shields.io/crates/d/qualia2fa-ffi?logo=crates.io&label=crates.io+Downloads)][crates.io]
+
+[License]: LICENSE
+
+[Releases]: https://github.com/Qualia2FA/Qualia2FA-FFI/releases
+
+[crates.io]: https://crates.io/crates/qualia2fa-ffi
+
+</div>
+
+---
 
 | Item | Value |
 |---|---|
@@ -14,10 +30,18 @@ Kotlin and Swift to call.
 | License | `LGPL-3.0-or-later` |
 | UniFFI | **`0.29`** |
 
-OTP capabilities, the vault, groups and orderings, importing and exporting, recovery keys,
-registration/login, challenge-response and synchronization are exported. On top of that, this
-layer **implements the LAN channel itself** (multicast discovery plus an endpoint data plane) —
-that half is Rust-only, and no host-side implementation could reach it.
+The following are exported:
+
+- OTP (TOTP / HOTP / mOTP / Yandex OTP / Steam Guard)
+- the vault
+- groups and orderings
+- importing and exporting
+- recovery keys
+- registration/login
+- challenge-response and synchronization
+
+On top of that, this layer **implements the LAN channel itself** (multicast discovery plus an
+endpoint data plane) — that half is Rust-only, and no host-side implementation could reach it.
 
 ## Usage
 
@@ -130,7 +154,7 @@ on another device, so **do not** implement an update as "remove + add".
 
 ### Importing (`FfiImport`)
 
-Reads another authenticator's export: `FfiImport.preview(bytes, format, password, now)` takes JSON,
+Imports an export from Qualia2FA / Aegis: `FfiImport.preview(bytes, format, password, now)` takes JSON,
 HTML or one URI per line (an encrypted JSON needs a password), and `detectFormat(bytes)` can guess
 the format from the content first. On the returned object, `entries` / `problems` / `groups` /
 `dropped` are what the preview shows, `compare(vault)` says which entries the vault already holds
